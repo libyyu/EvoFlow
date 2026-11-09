@@ -601,3 +601,6 @@ evopanel/src-tauri/gen/
 /docs/contribute/v4-streaming-alignment-logbook.md
 /backend/tests/FINAL_SUMMARY_*.md
 /backend/tests/IMPROVEMENTS_*.md
+
+# 本地临时脚本 / 日志（打包与排查用，不进仓库）
+/_temp/
