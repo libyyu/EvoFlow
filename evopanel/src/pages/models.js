@@ -478,9 +478,13 @@ function panelModelFromGatewayRow(m) {
     apiType,
     apiKey: apiKeyFromGatewayRow(m?.api_key),
     apiKeyConfiguredOnServer: isMaskedGatewayApiKey(m?.api_key),
+    // Per-principal model isolation: gateway rows carry owner info.
+    ownerPrincipalId: String(m?.owner_principal_id || '').trim() || null,
+    shared: !String(m?.owner_principal_id || '').trim(),
     entry: {
       configName,
       id: modelId,
+      shared: !String(m?.owner_principal_id || '').trim(),
       name: storedName,
       description: m?.description || null,
       contextWindow: resolvePanelContextWindow(m),
@@ -2569,6 +2573,7 @@ function renderModelCards(providerKey, models, primary) {
           <div class="model-info-top">
             <code class="model-id-text">${escHtml(displayName)}</code>
             ${isPrimary ? '<span class="tag tag--primary">\u4e3b\u6a21\u578b</span>' : ''}
+            ${m.shared === false ? '<span class="tag tag--private" title="\u4ec5\u4f60\u53ef\u89c1\u548c\u4f7f\u7528\u7684\u79c1\u6709\u6a21\u578b">\u79c1\u6709</span>' : ''}
             ${planModelBadgeHtml(m)}
             ${m.reasoning ? '<span class="tag tag--reasoning">\u63a8\u7406</span>' : ''}
             ${latencyTag}

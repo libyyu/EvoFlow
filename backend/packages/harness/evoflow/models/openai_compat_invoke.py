@@ -186,8 +186,13 @@ def build_langchain_messages(
     return out
 
 
-def resolve_model_name(model: str | None) -> tuple[str | None, Any]:
-    """Return (config_name_or_None, model_config). None name → primary/first."""
+def resolve_model_name(model: str | None, principal_id: Any = None) -> tuple[str | None, Any]:
+    """Return (config_name_or_None, model_config). None name → primary/first.
+
+    ``principal_id``: passed through to ``get_model_config`` so private models
+    resolve outside agent runs (e.g. gateway-side connection tests). ``None``
+    keeps the ambient-ContextVar default inside agent runs.
+    """
     config = get_app_config()
     if not config.models:
         raise OpenAICompatError(
@@ -196,7 +201,10 @@ def resolve_model_name(model: str | None) -> tuple[str | None, Any]:
         )
     name = str(model or "").strip() or None
     if name:
-        cfg = config.get_model_config(name)
+        if principal_id is None:
+            cfg = config.get_model_config(name)
+        else:
+            cfg = config.get_model_config(name, principal_id=principal_id)
         if cfg is None:
             # Also accept provider model id match
             for m in config.models:
@@ -339,11 +347,12 @@ async def ainvoke_chat_completion(
     temperature: float | None = None,
     thinking_enabled: bool | None = None,
     record_usage: bool = True,
+    principal_id: Any = None,
 ) -> dict[str, Any]:
     """Run one non-streaming chat completion; return OpenAI-shaped dict."""
     from evoflow.models import create_chat_model
 
-    name, model_cfg = resolve_model_name(model)
+    name, model_cfg = resolve_model_name(model, principal_id=principal_id)
     supports_vision = bool(getattr(model_cfg, "supports_vision", False))
     lc_messages = build_langchain_messages(messages, supports_vision=supports_vision)
 
@@ -441,10 +450,11 @@ def _invoke_chat_completion_sync(
     temperature: float | None = None,
     thinking_enabled: bool | None = None,
     record_usage: bool = True,
+    principal_id: Any = None,
 ) -> dict[str, Any]:
     from evoflow.models import create_chat_model
 
-    name, model_cfg = resolve_model_name(model)
+    name, model_cfg = resolve_model_name(model, principal_id=principal_id)
     supports_vision = bool(getattr(model_cfg, "supports_vision", False))
     lc_messages = build_langchain_messages(messages, supports_vision=supports_vision)
     thinking: bool | None = None

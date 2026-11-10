@@ -100,6 +100,13 @@ class ModelConfig(BaseModel):
         description="English vendor id (e.g. aliyun, openai); used when serializing models.providers",
     )
     name: str = Field(..., description="Unique name for the model")
+    owner_principal_id: str | None = Field(
+        default=None,
+        description=(
+            "Principal that owns this model (per-user model isolation). "
+            "None/empty = shared pool (visible to everyone, managed by org admins)."
+        ),
+    )
     display_name: str | None = Field(..., default_factory=lambda: None, description="Display name for the model")
     description: str | None = Field(..., default_factory=lambda: None, description="Description for the model")
     use: str = Field(

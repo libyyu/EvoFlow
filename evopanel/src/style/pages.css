@@ -10255,6 +10255,7 @@ html[data-theme='dark'] .models-sort-dropdown-panel {
 }
 .tag--primary { background: var(--success); color: #fff; }
 .tag--plan { background: rgba(234, 88, 12, 0.14); color: #c2410c; }
+.tag--private { background: rgba(124, 58, 237, 0.14); color: #7c3aed; }
 .tag--reasoning { background: var(--accent-muted); color: var(--accent); }
 .tag--vision { background: rgba(139, 92, 246, 0.18); color: #6d28d9; }
 

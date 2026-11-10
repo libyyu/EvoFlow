@@ -63,11 +63,14 @@ def _propagate_connection_to_models(
         return
     use = api_type_to_use(api_type)
     if update_api_key:
+        # Connection refresh only manages the shared pool — private models
+        # (per-principal keys) must never be overwritten by an org-level
+        # connection update.
         db.execute(
             """
             UPDATE evoflow_models
             SET base_url = ?, api_key = ?, use = ?, updated_at = ?
-            WHERE vendor = ?
+            WHERE vendor = ? AND owner_principal_id = ''
             """,
             (base_url, str(api_key or ""), use, now, vendor),
         )
@@ -76,7 +79,7 @@ def _propagate_connection_to_models(
             """
             UPDATE evoflow_models
             SET base_url = ?, use = ?, updated_at = ?
-            WHERE vendor = ?
+            WHERE vendor = ? AND owner_principal_id = ''
             """,
             (base_url, use, now, vendor),
         )

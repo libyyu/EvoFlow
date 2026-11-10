@@ -91,6 +91,12 @@ def _ensure_tool_search_defaults(config_data: dict[str, Any]) -> None:
         config_data["tool_search"] = {**raw, "enabled": False}
 
 
+# Sentinel for ``AppConfig.get_model_config(principal_id=...)``: resolve the
+# ambient principal from the authz runtime-identity ContextVar. Distinct from
+# ``None`` which explicitly means "no identity — shared pool only".
+_PRINCIPAL_AUTO = object()
+
+
 class AppConfig(BaseModel):
     """Config for the EvoFlow application"""
 
@@ -357,18 +363,36 @@ class AppConfig(BaseModel):
             return [cls.resolve_env_variables(item) for item in config]
         return config
 
-    def get_model_config(self, name: str) -> ModelConfig | None:
-        """Get the model config by name.
+    def get_model_config(self, name: str, principal_id: Any = _PRINCIPAL_AUTO) -> ModelConfig | None:
+        """Get the model config by name, honoring per-principal model isolation.
 
         Args:
             name: The name of the model to get the config for.
+            principal_id: Who is resolving the model.
 
-        Returns:
-            The model config if found, otherwise None.
+                * ``_PRINCIPAL_AUTO`` (default): read the ambient principal from
+                  the authz runtime identity ``ContextVar`` — agent runs resolve
+                  to the user who started them with zero call-site changes.
+                * An explicit principal id string: private models of that
+                  principal win over the shared pool.
+                * ``None``: no identity — only the shared pool is visible.
+
+        Matching order: exact ``(name, owner=principal)`` → exact shared
+        ``(name, owner=None)`` → the legacy vendor/suffix compatibility matches
+        (with the same owner preference).
         """
         name = (name or "").strip()
         if not name:
             return None
+
+        if principal_id is _PRINCIPAL_AUTO:
+            try:
+                from evoflow.authz.runtime_identity import get_current_principal_id
+
+                principal_id = get_current_principal_id() or None
+            except Exception:
+                principal_id = None
+        pid = str(principal_id or "").strip() or None
 
         def _entries() -> list[ModelConfig]:
             out: list[ModelConfig] = []
@@ -384,8 +408,16 @@ class AppConfig(BaseModel):
 
         models = _entries()
 
-        # 1) Exact match (the canonical form).
-        found = next((model for model in models if model.name == name), None)
+        def _owner_of(m: ModelConfig) -> str:
+            return str(getattr(m, "owner_principal_id", None) or "").strip()
+
+        # 1) Exact match with owner preference: the caller's private model
+        #    shadows a shared model with the same name.
+        if pid:
+            found = next((m for m in models if m.name == name and _owner_of(m) == pid), None)
+            if found is not None:
+                return found
+        found = next((m for m in models if m.name == name and not _owner_of(m)), None)
         if found is not None:
             return found
 
@@ -399,8 +431,12 @@ class AppConfig(BaseModel):
             vendor_prefix = parts[0].strip().lower()
             suffix = parts[1].strip()
             if suffix and suffix != name:
-                # 2a) Exact name match on the suffix (ignores vendor).
-                found = next((model for model in models if model.name == suffix), None)
+                # 2a) Exact name match on the suffix (ignores vendor), owner-preferred.
+                if pid:
+                    found = next((m for m in models if m.name == suffix and _owner_of(m) == pid), None)
+                    if found is not None:
+                        return found
+                found = next((m for m in models if m.name == suffix and not _owner_of(m)), None)
                 if found is not None:
                     return found
 
@@ -409,17 +445,24 @@ class AppConfig(BaseModel):
                 #     (e.g. aliyun/kimi-k2.5 vs moonshot/kimi-k2.5) resolve
                 #     to the correct provider.
                 if vendor_prefix:
-                    found = next(
-                        (model for model in models if str(getattr(model, "model", "")) == suffix and str(getattr(model, "vendor", "") or "").strip().lower() == vendor_prefix),
-                        None,
-                    )
+                    candidates = [m for m in models if str(getattr(m, "model", "")) == suffix and str(getattr(m, "vendor", "") or "").strip().lower() == vendor_prefix]
+                    if pid:
+                        found = next((m for m in candidates if _owner_of(m) == pid), None)
+                        if found is not None:
+                            return found
+                    found = next((m for m in candidates if not _owner_of(m)), None)
                     if found is not None:
                         return found
 
                 # 2c) Last-resort fallback: match by model field only.
                 #     Only used when vendor is not specified or no vendor match
                 #     was found (preserves original behavior for single-vendor setups).
-                found = next((model for model in models if str(getattr(model, "model", "")) == suffix), None)
+                fallback_candidates = [m for m in models if str(getattr(m, "model", "")) == suffix]
+                if pid:
+                    found = next((m for m in fallback_candidates if _owner_of(m) == pid), None)
+                    if found is not None:
+                        return found
+                found = next((m for m in fallback_candidates if not _owner_of(m)), None)
                 if found is not None:
                     return found
 
@@ -823,26 +866,34 @@ def _strip_platform_control_flags(data: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
-def add_model_to_config(model_data: dict) -> "ModelConfig":
+def add_model_to_config(model_data: dict, owner_principal_id: str | None = None) -> "ModelConfig":
     """Add a new model to the config.
 
     Args:
         model_data: Dictionary containing model configuration.
+        owner_principal_id: Ownership for per-principal model isolation.
+            ``None``/``''`` = shared pool; otherwise the creating principal's id.
 
     Returns:
         The created ModelConfig instance.
 
     Raises:
-        ValueError: If a model with the same name already exists.
+        ValueError: If a model with the same name (and owner) already exists.
     """
     from evoflow.config.model_config import ModelConfig
 
     global _app_config
     config = get_app_config()
+    owner = str(owner_principal_id or "").strip()
+    if owner:
+        model_data = {**model_data, "owner_principal_id": owner}
+    else:
+        model_data = {**model_data, "owner_principal_id": None}
 
-    # Check if model already exists
-    if any(m.name == model_data["name"] for m in config.models):
-        raise ValueError(f"Model '{model_data['name']}' already exists")
+    # Check if a model with the same name (and owner) already exists
+    for m in config.models:
+        if m.name == model_data["name"] and str(getattr(m, "owner_principal_id", None) or "").strip() == owner:
+            raise ValueError(f"Model '{model_data['name']}' already exists")
 
     model_data = _inherit_connection_api_key(_apply_default_thinking_payload(model_data))
     # Platform control-plane flags (confirm / dry_run …) are gate plumbing, never
@@ -863,12 +914,14 @@ def add_model_to_config(model_data: dict) -> "ModelConfig":
     return new_model
 
 
-def update_model_in_config(model_name: str, model_data: dict) -> "ModelConfig":
+def update_model_in_config(model_name: str, model_data: dict, owner_principal_id: str | None = None) -> "ModelConfig":
     """Update an existing model in the config.
 
     Args:
         model_name: The name of the model to update.
         model_data: Dictionary containing updated model configuration.
+        owner_principal_id: ``None`` = admin context (match any row with that
+            name, shared first); ``''``/pid = restrict to that owner's rows.
 
     Returns:
         The updated ModelConfig instance.
@@ -880,6 +933,7 @@ def update_model_in_config(model_name: str, model_data: dict) -> "ModelConfig":
 
     global _app_config
     config = get_app_config()
+    owner = str(owner_principal_id or "").strip()
 
     # Find the model
     model_index = None
@@ -890,7 +944,18 @@ def update_model_in_config(model_name: str, model_data: dict) -> "ModelConfig":
                 type(m).__name__,
             )
             continue
-        if m.name == model_name:
+        if m.name != model_name:
+            continue
+        row_owner = str(getattr(m, "owner_principal_id", None) or "").strip()
+        if owner_principal_id is None:
+            # Admin / legacy: prefer the shared row, fall back to any row.
+            if not row_owner:
+                model_index = i
+                break
+            if model_index is None:
+                model_index = i
+            continue
+        if row_owner == owner:
             model_index = i
             break
 
@@ -972,22 +1037,34 @@ def _apply_default_thinking_payload(model_data: dict[str, Any]) -> dict[str, Any
     return data
 
 
-def remove_model_from_config(model_name: str) -> None:
+def remove_model_from_config(model_name: str, owner_principal_id: str | None = None) -> None:
     """Remove a model from the config.
 
     Args:
         model_name: The name of the model to remove.
+        owner_principal_id: ``None`` = admin context (any row with that name);
+            ``''``/pid = restrict removal to that owner's rows.
 
     Raises:
         ValueError: If the model is not found.
     """
     global _app_config
     config = get_app_config()
+    owner = str(owner_principal_id or "").strip()
 
     # Find and remove the model
     original_count = len(config.models)
     was_primary = (config.primary_model or "").strip() == model_name.strip()
-    config.models = [m for m in config.models if m.name != model_name]
+
+    def _match(m: Any) -> bool:
+        if m.name != model_name:
+            return False
+        row_owner = str(getattr(m, "owner_principal_id", None) or "").strip()
+        if owner_principal_id is None:
+            return True
+        return row_owner == owner
+
+    config.models = [m for m in config.models if not _match(m)]
 
     if len(config.models) == original_count:
         raise ValueError(f"Model '{model_name}' not found")
@@ -1002,4 +1079,4 @@ def remove_model_from_config(model_name: str) -> None:
     if was_primary and config.primary_model:
         cfg_repo.set_app_setting("primary_model", config.primary_model)
 
-    cfg_repo.delete_model(model_name)
+    cfg_repo.delete_model(model_name, owner_principal_id=owner_principal_id)

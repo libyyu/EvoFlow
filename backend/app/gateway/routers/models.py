@@ -6,7 +6,70 @@ from urllib.parse import urlparse
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
 
-from evoflow.authz.http_guard import require_org_admin
+from evoflow.authz.http_guard import require_org_admin, resolve_authz_from_request
+
+
+def _request_principal_id(request: Request | None) -> str | None:
+    """Resolve current principal_id from the HTTP request (JWT / local admin)."""
+    try:
+        from evoflow.authz.context import resolve_request_principal
+
+        p = resolve_request_principal(request)
+        uid = str((p or {}).get("principal_id") or "").strip()
+        return uid or None
+    except Exception:
+        return None
+
+
+def _request_is_admin(request: Request | None) -> bool:
+    """Whether the caller is an org admin (local bootstrap admin counts)."""
+    try:
+        if not _has_auth_signals(request):
+            # Local no-credential request (platform bridge / single-user) → admin.
+            return True
+        return bool(resolve_authz_from_request(request).get("is_admin"))
+    except Exception:
+        return False
+
+
+def _has_auth_signals(request: Request | None) -> bool:
+    """Mirror http_guard._has_auth_signals: any credential attached?"""
+    try:
+        return bool(getattr(request.state, "webui_user", None))
+    except Exception:
+        return False
+
+
+# Sentinel: caller may not touch this model at all.
+_OWNER_FORBIDDEN = object()
+
+
+def _resolve_target_owner(model_name: str, pid: str | None, is_admin: bool):
+    """Decide which ownership scope an update/delete should target.
+
+    Returns the ``owner_principal_id`` value to scope the write to, or
+    ``_OWNER_FORBIDDEN`` when the caller may not touch the model at all:
+
+    * admins: ``None`` (legacy: match any row, shared first) — they manage
+      the shared pool and can also fix private rows for support purposes.
+    * non-admins with a shared row: forbidden.
+    * non-admins with a private row: their own pid (also when no row exists
+      yet, so create-style upserts land in their own scope).
+    """
+    if is_admin:
+        return None
+    from evoflow.persistence import config_repositories as cfg_repo
+
+    name = str(model_name or "").strip()
+    row = cfg_repo.get_model(name) if name else None
+    row_owner = str((row or {}).get("owner_principal_id") or "").strip()
+    if row and not row_owner:
+        return _OWNER_FORBIDDEN  # shared pool — admin territory
+    if not pid:
+        return _OWNER_FORBIDDEN
+    if row and row_owner != pid:
+        return _OWNER_FORBIDDEN  # someone else's private model
+    return pid
 from evoflow.config import get_app_config
 from evoflow.config.model_config import DEFAULT_MODEL_MAX_RETRIES, DEFAULT_MODEL_REQUEST_TIMEOUT
 from evoflow.models.credential_sanitize import is_masked_api_key
@@ -21,6 +84,11 @@ class ModelResponse(BaseModel):
     """Response model for model information."""
 
     name: str = Field(..., description="Unique identifier for the model")
+    owner_principal_id: str | None = Field(
+        None, description="Principal owning this private model; None = shared pool"
+    )
+    is_shared: bool = Field(default=True, description="Whether the model is in the shared pool")
+    is_mine: bool = Field(default=False, description="Whether the model is owned by the current viewer")
     vendor: str | None = Field(None, description="English vendor id (e.g. aliyun, openai)")
     model: str = Field(..., description="Actual provider model identifier")
     display_name: str | None = Field(None, description="Human-readable name")
@@ -81,15 +149,20 @@ class ModelResponse(BaseModel):
     )
 
 
-def _to_model_response(model: Any) -> ModelResponse:
+def _to_model_response(model: Any, viewer_principal_id: str | None = None) -> ModelResponse:
     """Serialize a ModelConfig (or duck-typed row) into the public API shape."""
     fb_raw = getattr(model, "fallback_models", None) or []
     fallback_models = [str(x).strip() for x in fb_raw if str(x or "").strip()]
     status = str(getattr(model, "availability_status", None) or "available").strip().lower()
     if status not in ("available", "unavailable"):
         status = "available"
+    owner = str(getattr(model, "owner_principal_id", None) or "").strip()
+    viewer = str(viewer_principal_id or "").strip()
     return ModelResponse(
         name=model.name,
+        owner_principal_id=owner or None,
+        is_shared=not owner,
+        is_mine=bool(owner and viewer and owner == viewer),
         vendor=getattr(model, "vendor", None),
         model=model.model,
         display_name=model.display_name,
@@ -133,14 +206,17 @@ class ModelsListResponse(BaseModel):
     summary="List All Models",
     description="Retrieve a list of all available AI models configured in the system.",
 )
-async def list_models() -> ModelsListResponse:
-    """List all available models from configuration.
+async def list_models(http_request: Request) -> ModelsListResponse:
+    """List models visible to the caller.
+
+    Per-principal model isolation: callers see the shared pool plus their own
+    private models; org admins (and local single-user sessions) see everything.
 
     Returns model information suitable for frontend display,
     excluding sensitive fields like API keys and internal configuration.
 
     Returns:
-        A list of all configured models with their metadata.
+        A list of visible models with their metadata.
 
     Example Response:
         ```json
@@ -150,13 +226,14 @@ async def list_models() -> ModelsListResponse:
                     "name": "gpt-4",
                     "display_name": "GPT-4",
                     "description": "OpenAI GPT-4 model",
-                    "supports_thinking": false
+                    "supports_thinking": false,
+                    "is_shared": true
                 },
                 {
                     "name": "claude-3-opus",
                     "display_name": "Claude 3 Opus",
-                    "description": "Anthropic Claude 3 Opus model",
-                    "supports_thinking": true
+                    "is_shared": false,
+                    "is_mine": true
                 }
             ]
         }
@@ -164,11 +241,20 @@ async def list_models() -> ModelsListResponse:
     """
     from evoflow.config import get_app_config, reload_models_from_db
 
+    viewer = _request_principal_id(http_request)
     try:
         config = reload_models_from_db()
     except Exception:
         config = get_app_config()
-    models = [_to_model_response(model) for model in config.models]
+    if _request_is_admin(http_request):
+        models = [_to_model_response(m, viewer) for m in config.models]
+    else:
+        models = [
+            _to_model_response(m, viewer)
+            for m in config.models
+            if not str(getattr(m, "owner_principal_id", None) or "").strip()
+            or str(getattr(m, "owner_principal_id", None) or "").strip() == (viewer or "")
+        ]
     return ModelsListResponse(models=models)
 
 
@@ -276,7 +362,7 @@ class ModelInvokeResponse(BaseModel):
     description="Run one chat completion using EvoFlow DB-backed model config, same as the main agent stack. "
     "content may be a string or OpenAI multimodal array (vision).",
 )
-async def invoke_configured_model(request: ModelInvokeRequest) -> ModelInvokeResponse:
+async def invoke_configured_model(request: ModelInvokeRequest, http_request: Request) -> ModelInvokeResponse:
     from evoflow.models.openai_compat_invoke import OpenAICompatError, ainvoke_chat_completion
 
     messages = [{"role": m.role, "content": m.content} for m in request.messages]
@@ -287,6 +373,7 @@ async def invoke_configured_model(request: ModelInvokeRequest) -> ModelInvokeRes
             temperature=request.temperature,
             thinking_enabled=request.thinking_enabled,
             record_usage=True,
+            principal_id=_request_principal_id(http_request),
         )
     except OpenAICompatError as e:
         raise HTTPException(status_code=e.status_code, detail=e.message) from e
@@ -344,8 +431,8 @@ async def get_tokenizer_status() -> dict:
     summary="Get Model Details",
     description="Retrieve detailed information about a specific AI model by its name.",
 )
-async def get_model(model_name: str) -> ModelResponse:
-    """Get a specific model by name.
+async def get_model(model_name: str, http_request: Request) -> ModelResponse:
+    """Get a specific model by name (shared pool + caller's private models).
 
     Args:
         model_name: The unique name of the model to retrieve.
@@ -354,7 +441,7 @@ async def get_model(model_name: str) -> ModelResponse:
         Model information if found.
 
     Raises:
-        HTTPException: 404 if model not found.
+        HTTPException: 404 if model not found (or not visible to the caller).
 
     Example Response:
         ```json
@@ -367,17 +454,33 @@ async def get_model(model_name: str) -> ModelResponse:
         ```
     """
     config = get_app_config()
-    model = config.get_model_config(model_name)
+    viewer = _request_principal_id(http_request)
+    if _request_is_admin(http_request):
+        # Admins see any row with that name; prefer the shared one.
+        model = next(
+            (m for m in config.models if m.name == model_name and not str(getattr(m, "owner_principal_id", None) or "").strip()),
+            None,
+        ) or next((m for m in config.models if m.name == model_name), None)
+    else:
+        model = config.get_model_config(model_name, principal_id=viewer)
     if model is None:
         raise HTTPException(status_code=404, detail=f"Model '{model_name}' not found")
 
-    return _to_model_response(model)
+    return _to_model_response(model, viewer)
 
 
 class ModelCreateRequest(BaseModel):
     """Request model for creating/updating a model."""
 
     name: str = Field(..., description="Unique identifier for the model")
+    shared: bool | None = Field(
+        default=None,
+        description=(
+            "Ownership: true = shared pool (org admin only), false = private to the "
+            "caller. Admin default (unset) is shared for legacy compatibility; "
+            "non-admins always get a private model."
+        ),
+    )
     vendor: str | None = Field(None, description="English vendor id (e.g. aliyun); one connection per vendor in YAML")
     model: str = Field(..., description="Actual provider model identifier")
     display_name: str | None = Field(None, description="Human-readable name")
@@ -441,6 +544,10 @@ class ModelCreateRequest(BaseModel):
 async def create_model(http_request: Request, request: ModelCreateRequest) -> ModelResponse:
     """Create a new model configuration.
 
+    Per-principal model isolation: any signed-in principal may create a private
+    model (owned by themselves). Org admins additionally create shared-pool
+    models via ``shared: true`` (default for admins to preserve legacy imports).
+
     Args:
         request: Model configuration data.
 
@@ -448,18 +555,27 @@ async def create_model(http_request: Request, request: ModelCreateRequest) -> Mo
         Created model information.
 
     Raises:
-        HTTPException: 400 if model already exists.
+        HTTPException: 400 if a model with the same name/owner already exists.
     """
-    require_org_admin(http_request)
     import traceback
 
     from evoflow.config import add_model_to_config, reload_models_from_db
 
+    pid = _request_principal_id(http_request)
+    is_admin = _request_is_admin(http_request)
+    shared_req = getattr(request, "shared", None)
+    if shared_req and not is_admin:
+        raise HTTPException(status_code=403, detail="Only org admins can create shared models")
+    # Admin unset → shared (legacy compatibility); everyone else → private.
+    shared = bool(shared_req) if shared_req is not None else bool(is_admin)
+    owner = None if (shared or not pid) else pid
+
     try:
         request_data = request.model_dump(exclude_none=True)
-        model_config = add_model_to_config(request_data)
+        request_data.pop("shared", None)
+        model_config = add_model_to_config(request_data, owner_principal_id=owner)
         reload_models_from_db()
-        return _to_model_response(model_config)
+        return _to_model_response(model_config, pid)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
@@ -477,6 +593,10 @@ async def create_model(http_request: Request, request: ModelCreateRequest) -> Mo
 async def update_model(http_request: Request, model_name: str, request: ModelCreateRequest) -> ModelResponse:
     """Update an existing model configuration.
 
+    Ownership rules: org admins may update any model; other principals may
+    only update their own private models (shared-pool models are read-only
+    for them).
+
     Args:
         model_name: The unique name of the model to update.
         request: Updated model configuration data.
@@ -485,15 +605,23 @@ async def update_model(http_request: Request, model_name: str, request: ModelCre
         Updated model information.
 
     Raises:
-        HTTPException: 404 if model not found.
+        HTTPException: 403 if the caller may not touch this model; 404 if model not found.
     """
-    require_org_admin(http_request)
     import traceback
 
     from evoflow.config import reload_models_from_db, update_model_in_config
 
+    pid = _request_principal_id(http_request)
+    is_admin = _request_is_admin(http_request)
+    target_owner = _resolve_target_owner(model_name, pid, is_admin)
+    if target_owner is _OWNER_FORBIDDEN:
+        raise HTTPException(status_code=403, detail="Only org admins can modify shared models")
+
     try:
         request_data = request.model_dump(exclude_unset=True)
+        # Ownership never changes through update.
+        request_data.pop("shared", None)
+        request_data.pop("owner_principal_id", None)
         # Skip masked API key to prevent overwriting the real key with a masked value
         _api_key_val = request_data.get("api_key")
         if _api_key_val is not None and is_masked_api_key(_api_key_val):
@@ -510,9 +638,11 @@ async def update_model(http_request: Request, model_name: str, request: ModelCre
         for k in list(request_data.keys()):
             if request_data[k] is None:
                 request_data[k] = None
-        model_config = update_model_in_config(model_name, request_data)
+        model_config = update_model_in_config(
+            model_name, request_data, owner_principal_id=target_owner
+        )
         reload_models_from_db()
-        return _to_model_response(model_config)
+        return _to_model_response(model_config, pid)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
@@ -554,6 +684,9 @@ async def clear_model_unavailable_status(request: Request, model_name: str) -> M
 async def delete_model(request: Request, model_name: str) -> dict:
     """Delete a model configuration.
 
+    Ownership rules: org admins may delete any model; other principals may
+    only delete their own private models.
+
     Args:
         model_name: The unique name of the model to delete.
 
@@ -561,13 +694,18 @@ async def delete_model(request: Request, model_name: str) -> dict:
         Success message.
 
     Raises:
-        HTTPException: 404 if model not found.
+        HTTPException: 403 if the caller may not delete this model; 404 if model not found.
     """
-    require_org_admin(request)
     from evoflow.config import reload_models_from_db, remove_model_from_config
 
+    pid = _request_principal_id(request)
+    is_admin = _request_is_admin(request)
+    target_owner = _resolve_target_owner(model_name, pid, is_admin)
+    if target_owner is _OWNER_FORBIDDEN:
+        raise HTTPException(status_code=403, detail="Only org admins can delete shared models")
+
     try:
-        remove_model_from_config(model_name)
+        remove_model_from_config(model_name, owner_principal_id=target_owner)
         reload_models_from_db()
         return {"message": f"Model '{model_name}' deleted successfully"}
     except ValueError as e:

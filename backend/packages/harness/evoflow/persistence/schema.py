@@ -1028,7 +1028,8 @@ CREATE TABLE IF NOT EXISTS evoflow_model_connections (
         );
 
 CREATE TABLE IF NOT EXISTS "evoflow_models" (
-    name TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    owner_principal_id TEXT NOT NULL DEFAULT '',
     vendor TEXT,
     display_name TEXT,
     description TEXT,
@@ -1049,7 +1050,9 @@ CREATE TABLE IF NOT EXISTS "evoflow_models" (
     thinking_json TEXT NOT NULL DEFAULT '{}',
     extra_json TEXT NOT NULL DEFAULT '{}',
     updated_at TEXT NOT NULL
-, context_length INTEGER, input_context_length INTEGER, output_context_length INTEGER, availability_status TEXT NOT NULL DEFAULT 'available', unavailable_reason TEXT, unavailable_code TEXT, unavailable_at TEXT, plan_type TEXT DEFAULT 'none', plan_config TEXT);
+, context_length INTEGER, input_context_length INTEGER, output_context_length INTEGER, availability_status TEXT NOT NULL DEFAULT 'available', unavailable_reason TEXT, unavailable_code TEXT, unavailable_at TEXT, plan_type TEXT DEFAULT 'none', plan_config TEXT,
+    PRIMARY KEY (name, owner_principal_id)
+);
 
 CREATE TABLE IF NOT EXISTS evoflow_org_artifacts (
             id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2198,6 +2201,78 @@ def _backfill_legacy_columns(conn: sqlite3.Connection) -> None:
         logger.debug("schema: task duration backfill failed", exc_info=True)
 
 
+# Column list shared by the baseline DDL and the owner-ownership migration
+# below. Keep in sync with the ``evoflow_models`` DDL in ``_BASELINE_DDL``.
+_MODELS_OWNER_MIGRATION_DDL = """
+CREATE TABLE IF NOT EXISTS "evoflow_models_new" (
+    name TEXT NOT NULL,
+    owner_principal_id TEXT NOT NULL DEFAULT '',
+    vendor TEXT,
+    display_name TEXT,
+    description TEXT,
+    use TEXT NOT NULL,
+    model TEXT NOT NULL,
+    base_url TEXT,
+    api_key TEXT,
+    request_timeout REAL,
+    max_retries INTEGER,
+    max_tokens INTEGER,
+    temperature REAL,
+    use_responses_api INTEGER,
+    output_version TEXT,
+    supports_thinking INTEGER NOT NULL DEFAULT 0,
+    supports_reasoning_effort INTEGER NOT NULL DEFAULT 0,
+    supports_vision INTEGER NOT NULL DEFAULT 0,
+    when_thinking_enabled_json TEXT NOT NULL DEFAULT '{}',
+    thinking_json TEXT NOT NULL DEFAULT '{}',
+    context_length INTEGER,
+    input_context_length INTEGER,
+    output_context_length INTEGER,
+    availability_status TEXT NOT NULL DEFAULT 'available',
+    unavailable_reason TEXT,
+    unavailable_code TEXT,
+    unavailable_at TEXT,
+    extra_json TEXT NOT NULL DEFAULT '{}',
+    plan_type TEXT DEFAULT 'none',
+    plan_config TEXT,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (name, owner_principal_id)
+)
+"""
+
+
+def _ensure_models_owner_schema(conn: sqlite3.Connection) -> None:
+    """Idempotent: give ``evoflow_models`` per-principal ownership.
+
+    Legacy tables have ``PRIMARY KEY (name)`` and no ``owner_principal_id``
+    column; the baseline ``CREATE TABLE IF NOT EXISTS`` cannot add either.
+    Rebuild the table with ``PRIMARY KEY (name, owner_principal_id)`` and
+    backfill every existing row as shared (owner = ``''``).
+
+    ``owner_principal_id`` semantics: ``''`` = shared pool (visible to every
+    principal, managed by org admins); any other value = a private model owned
+    by that principal. An empty string (not NULL) is used so the composite
+    primary key deduplicates shared rows correctly.
+    """
+    cols = {str(r[1]) for r in conn.execute("PRAGMA table_info(evoflow_models)").fetchall()}
+    if "owner_principal_id" in cols:
+        return  # already migrated (or fresh install from the new baseline)
+    logger.info("schema: migrating evoflow_models to composite PK (name, owner_principal_id)")
+    conn.executescript("DROP TABLE IF EXISTS evoflow_models_new;")
+    conn.execute(_MODELS_OWNER_MIGRATION_DDL.strip())
+    # Copy only the columns the legacy table actually has (defensive: a legacy
+    # table might predate some post-baseline column).
+    new_cols = [str(r[1]) for r in conn.execute("PRAGMA table_info(evoflow_models_new)").fetchall()]
+    shared = [c for c in new_cols if c in cols]
+    col_list = ", ".join(shared)
+    conn.execute(
+        f"INSERT INTO evoflow_models_new ({col_list}) SELECT {col_list} FROM evoflow_models"
+    )
+    conn.execute("DROP TABLE evoflow_models")
+    conn.execute("ALTER TABLE evoflow_models_new RENAME TO evoflow_models")
+    conn.commit()
+
+
 def _ensure_media_assets_schema(conn: sqlite3.Connection) -> None:
     """Ensure media call-ledger columns exist on current DBs (no schema bump)."""
     if not _table_exists(conn, "evoflow_media_assets"):
@@ -2748,6 +2823,7 @@ def ensure_app_schema(conn: sqlite3.Connection) -> None:
     version = int(conn.execute("PRAGMA user_version").fetchone()[0] or 0)
     if version == 0:
         _apply_baseline(conn)
+        _ensure_models_owner_schema(conn)
         _ensure_asset_memory_runs_table(conn)
         _ensure_session_runtime_tables(conn)
         _ensure_person_affect_hormones(conn)
@@ -2760,6 +2836,7 @@ def ensure_app_schema(conn: sqlite3.Connection) -> None:
         # the full baseline on every connection open.
         if int(conn.execute("PRAGMA user_version").fetchone()[0] or 0) == APP_SCHEMA_VERSION:
             _ensure_duty_runs_table(conn)
+            _ensure_models_owner_schema(conn)
             _ensure_asset_memory_runs_table(conn)
             _ensure_session_runtime_tables(conn)
             _ensure_person_affect_hormones(conn)
@@ -2770,6 +2847,7 @@ def ensure_app_schema(conn: sqlite3.Connection) -> None:
             return
         _apply_baseline(conn)
         _ensure_duty_runs_table(conn)
+        _ensure_models_owner_schema(conn)
         _ensure_asset_memory_runs_table(conn)
         _ensure_session_runtime_tables(conn)
         _ensure_person_affect_hormones(conn)
@@ -2780,6 +2858,7 @@ def ensure_app_schema(conn: sqlite3.Connection) -> None:
         return
     # version == APP_SCHEMA_VERSION: already current — still ensure post-baseline tables.
     _ensure_duty_runs_table(conn)
+    _ensure_models_owner_schema(conn)
     _ensure_asset_memory_runs_table(conn)
     _ensure_session_runtime_tables(conn)
     _ensure_person_affect_hormones(conn)

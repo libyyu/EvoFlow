@@ -46,7 +46,7 @@ def _row_dict(row: Any) -> dict[str, Any]:
 
 _MODEL_INSERT = """
     INSERT INTO evoflow_models (
-        name, vendor, display_name, description, use, model,
+        name, owner_principal_id, vendor, display_name, description, use, model,
         base_url, api_key, request_timeout, max_retries, max_tokens, temperature,
         use_responses_api, output_version,
         supports_thinking, supports_reasoning_effort, supports_vision,
@@ -54,7 +54,7 @@ _MODEL_INSERT = """
         context_length, input_context_length, output_context_length,
         availability_status, unavailable_reason, unavailable_code, unavailable_at,
         extra_json, plan_type, plan_config, updated_at
-    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 """
 
 
@@ -75,6 +75,7 @@ def _insert_model(conn: Any, doc: dict[str, Any], now: str) -> None:
         _MODEL_INSERT,
         (
             r["name"],
+            r.get("owner_principal_id") or "",
             r["vendor"],
             r["display_name"],
             r["description"],
@@ -149,17 +150,25 @@ def update_model_plan_config(model_name: str, plan_type: str, plan_config: dict 
     else:
         plan_config_json = None
 
-    result = conn.execute("UPDATE evoflow_models SET plan_type = ?, plan_config = ?, updated_at = ? WHERE name = ?", (plan_type, plan_config_json, now, model_name))
+    # Plan sync only manages the shared pool; private models are untouched.
+    result = conn.execute(
+        "UPDATE evoflow_models SET plan_type = ?, plan_config = ?, updated_at = ? WHERE name = ? AND owner_principal_id = ''",
+        (plan_type, plan_config_json, now, model_name),
+    )
     conn.commit()
     return result.rowcount > 0
 
 
-def list_models() -> list[dict[str, Any]]:
-    rows = (
-        get_db()
-        .execute(
-            """
-        SELECT name, vendor, display_name, description, use, model,
+def list_models(principal_id: str | None = None) -> list[dict[str, Any]]:
+    """List model documents.
+
+    Args:
+        principal_id: When given, only rows visible to that principal are
+            returned (shared pool ``owner=''`` plus their own private models).
+            ``None`` returns everything (used by AppConfig bootstrap / admin).
+    """
+    sql = """
+        SELECT name, owner_principal_id, vendor, display_name, description, use, model,
                base_url, api_key, request_timeout, max_retries, max_tokens, temperature,
                use_responses_api, output_version,
                supports_thinking, supports_reasoning_effort, supports_vision,
@@ -167,19 +176,36 @@ def list_models() -> list[dict[str, Any]]:
                context_length, input_context_length, output_context_length,
                availability_status, unavailable_reason, unavailable_code, unavailable_at,
                extra_json, plan_type, plan_config
-        FROM evoflow_models ORDER BY name
-        """
-        )
-        .fetchall()
-    )
+        FROM evoflow_models
+    """
+    params: tuple = ()
+    pid = str(principal_id or "").strip()
+    if pid:
+        sql += " WHERE owner_principal_id = '' OR owner_principal_id = ?"
+        params = (pid,)
+    sql += " ORDER BY name"
+    rows = get_db().execute(sql, params).fetchall()
     return [model_row_to_doc(_row_dict(row)) for row in rows]
 
 
-def update_model_api_key(model_name: str, api_key: str) -> bool:
-    """Update only the API key for a model (useful when key is changed via URL param)."""
+def update_model_api_key(model_name: str, api_key: str, owner_principal_id: str | None = None) -> bool:
+    """Update only the API key for a model (useful when key is changed via URL param).
+
+    ``owner_principal_id``: ``None`` = any row with that name (legacy/admin
+    behavior); ``''`` = shared rows only; otherwise the caller's own rows only.
+    """
     conn = get_db()
     now = utc_now_iso_z()
-    result = conn.execute("UPDATE evoflow_models SET api_key = ?, updated_at = ? WHERE name = ?", (api_key, now, model_name))
+    if owner_principal_id is None:
+        result = conn.execute(
+            "UPDATE evoflow_models SET api_key = ?, updated_at = ? WHERE name = ?",
+            (api_key, now, model_name),
+        )
+    else:
+        result = conn.execute(
+            "UPDATE evoflow_models SET api_key = ?, updated_at = ? WHERE name = ? AND owner_principal_id = ?",
+            (api_key, now, model_name, owner_principal_id),
+        )
     conn.commit()
     return result.rowcount > 0
 
@@ -1196,7 +1222,7 @@ def upsert_model(document: dict[str, Any]) -> None:
         db.execute(
             """
             INSERT INTO evoflow_models (
-                name, vendor, display_name, description, use, model,
+                name, owner_principal_id, vendor, display_name, description, use, model,
                 base_url, api_key, request_timeout, max_retries, max_tokens, temperature,
                 use_responses_api, output_version,
                 supports_thinking, supports_reasoning_effort, supports_vision,
@@ -1204,8 +1230,8 @@ def upsert_model(document: dict[str, Any]) -> None:
                 context_length, input_context_length, output_context_length,
                 availability_status, unavailable_reason, unavailable_code, unavailable_at,
                 extra_json, plan_type, plan_config, updated_at
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-            ON CONFLICT(name) DO UPDATE SET
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(name, owner_principal_id) DO UPDATE SET
                 vendor = excluded.vendor,
                 display_name = excluded.display_name,
                 description = excluded.description,
@@ -1234,6 +1260,7 @@ def upsert_model(document: dict[str, Any]) -> None:
             """,
             (
                 r["name"],
+                r.get("owner_principal_id") or "",
                 r["vendor"],
                 r["display_name"],
                 r["description"],
@@ -1274,8 +1301,13 @@ def mark_model_unavailable(
     *,
     reason: str,
     code: str | None = None,
+    owner_principal_id: str | None = None,
 ) -> bool:
-    """Persist unavailable status for a configured model. Returns False if missing."""
+    """Persist unavailable status for a configured model. Returns False if missing.
+
+    ``owner_principal_id`` (optional): scope the mark to the shared pool (``''``)
+    or one principal's private row. ``None`` marks every row with that name.
+    """
     model_name = str(name or "").strip()
     if not model_name:
         return False
@@ -1286,43 +1318,58 @@ def mark_model_unavailable(
     # is_model_unavailable) so a passing rate-limit storm does not leave a
     # model stuck "unavailable" until someone clicks clear in the panel.
 
+    where = "WHERE name = ?"
+    params: list = [model_name]
+    if owner_principal_id is not None:
+        where += " AND owner_principal_id = ?"
+        params.append(owner_principal_id)
+
     def _write(db: Any) -> bool:
         cur = db.execute(
-            """
+            f"""
             UPDATE evoflow_models
             SET availability_status = 'unavailable',
                 unavailable_reason = ?,
                 unavailable_code = ?,
                 unavailable_at = ?,
                 updated_at = ?
-            WHERE name = ?
+            {where}
             """,
-            (reason_text, code_text, now, now, model_name),
+            (reason_text, code_text, now, now, *params),
         )
         return cur.rowcount > 0
 
     return bool(run_db_transaction(_write))
 
 
-def clear_model_unavailable(name: str) -> bool:
-    """Clear unavailable mark; returns True only when a row was actually cleared."""
+def clear_model_unavailable(name: str, owner_principal_id: str | None = None) -> bool:
+    """Clear unavailable mark; returns True only when a row was actually cleared.
+
+    ``owner_principal_id`` semantics as in :func:`mark_model_unavailable`.
+    """
     model_name = str(name or "").strip()
     if not model_name:
         return False
     now = utc_now_iso_z()
 
+    where = "WHERE name = ? AND availability_status = 'unavailable'"
+    params: list = [model_name]
+    if owner_principal_id is not None:
+        where += " AND owner_principal_id = ?"
+        params.append(owner_principal_id)
+
     def _write(db: Any) -> bool:
         cur = db.execute(
-            """
+            f"""
             UPDATE evoflow_models
             SET availability_status = 'available',
                 unavailable_reason = NULL,
                 unavailable_code = NULL,
                 unavailable_at = NULL,
                 updated_at = ?
-            WHERE name = ? AND availability_status = 'unavailable'
+            {where}
             """,
-            (now, model_name),
+            (now, *params),
         )
         return cur.rowcount > 0
 
@@ -1381,15 +1428,26 @@ def is_model_unavailable(name: str) -> bool:
     return True
 
 
-def delete_model(name: str) -> bool:
+def delete_model(name: str, owner_principal_id: str | None = None) -> bool:
+    """Delete a model row.
+
+    ``owner_principal_id``: ``None`` = any row with that name (legacy/admin);
+    ``''`` = shared rows only; otherwise only the caller's own private rows.
+    """
     name = name.strip()
-    row = get_model(name)
+    row = get_model(name, owner_principal_id)
     if not row:
         return False
     vendor = str(row.get("vendor") or "").strip()
 
     def _write(db: Any) -> bool:
-        cur = db.execute("DELETE FROM evoflow_models WHERE name = ?", (name,))
+        if owner_principal_id is None:
+            cur = db.execute("DELETE FROM evoflow_models WHERE name = ?", (name,))
+        else:
+            cur = db.execute(
+                "DELETE FROM evoflow_models WHERE name = ? AND owner_principal_id = ?",
+                (name, owner_principal_id),
+            )
         if cur.rowcount <= 0:
             return False
         primary = db.execute(
@@ -1415,12 +1473,14 @@ def delete_model(name: str) -> bool:
     return deleted
 
 
-def get_model(name: str) -> dict[str, Any] | None:
-    row = (
-        get_db()
-        .execute(
-            """
-        SELECT name, vendor, display_name, description, use, model,
+def get_model(name: str, owner_principal_id: str | None = None) -> dict[str, Any] | None:
+    """Fetch one model document.
+
+    ``owner_principal_id``: ``None`` = any row with that name (first match);
+    ``''`` = shared rows only; otherwise only that principal's private rows.
+    """
+    sql = """
+        SELECT name, owner_principal_id, vendor, display_name, description, use, model,
                base_url, api_key, request_timeout, max_retries, max_tokens, temperature,
                use_responses_api, output_version,
                supports_thinking, supports_reasoning_effort, supports_vision,
@@ -1429,11 +1489,12 @@ def get_model(name: str) -> dict[str, Any] | None:
                availability_status, unavailable_reason, unavailable_code, unavailable_at,
                extra_json
         FROM evoflow_models WHERE name = ?
-        """,
-            (name.strip(),),
-        )
-        .fetchone()
-    )
+    """
+    params: tuple = (name.strip(),)
+    if owner_principal_id is not None:
+        sql += " AND owner_principal_id = ?"
+        params = (name.strip(), owner_principal_id)
+    row = get_db().execute(sql, params).fetchone()
     if not row:
         return None
     return model_row_to_doc(_row_dict(row))

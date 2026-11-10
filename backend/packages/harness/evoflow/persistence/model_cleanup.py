@@ -124,7 +124,12 @@ def _delete_model_row(name: str) -> bool:
         return False
 
     def _write(db: Any) -> bool:
-        cur = db.execute("DELETE FROM evoflow_models WHERE name = ?", (name,))
+        # Connection-bound cleanup only manages the shared pool; private
+        # models (per-principal keys) are never removed by connection resets.
+        cur = db.execute(
+            "DELETE FROM evoflow_models WHERE name = ? AND owner_principal_id = ''",
+            (name,),
+        )
         if cur.rowcount <= 0:
             return False
         primary = db.execute(

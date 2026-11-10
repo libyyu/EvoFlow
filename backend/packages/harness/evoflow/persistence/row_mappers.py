@@ -91,6 +91,8 @@ _MODEL_SCALAR_KEYS = frozenset(
 
 def model_doc_to_row(doc: dict[str, Any]) -> dict[str, Any]:
     known, extra = _split_extra(doc, _MODEL_SCALAR_KEYS)
+    # Ownership is a dedicated column, never a vendor extra.
+    extra.pop("owner_principal_id", None)
     # context_length / input_context_length / output_context_length are
     # dedicated columns (v57); pull from doc so they never end up in extra_json.
     context_length = _int_or_none(doc.get("context_length"))
@@ -121,6 +123,9 @@ def model_doc_to_row(doc: dict[str, Any]) -> dict[str, Any]:
         availability_status = "available"
     return {
         "name": str(known.get("name") or doc.get("name") or "").strip(),
+        # Ownership: '' = shared pool (org-admin managed); stripped otherwise
+        # because ``owner_principal_id`` never belongs in extra_json.
+        "owner_principal_id": str(doc.get("owner_principal_id") or "").strip(),
         "vendor": known.get("vendor"),
         "display_name": known.get("display_name"),
         "description": known.get("description"),
@@ -152,6 +157,10 @@ def model_doc_to_row(doc: dict[str, Any]) -> dict[str, Any]:
 
 def model_row_to_doc(r: dict[str, Any]) -> dict[str, Any]:
     out: dict[str, Any] = {"name": r["name"], "use": r["use"], "model": r["model"]}
+    # Ownership (per-principal model isolation): '' (or missing) = shared pool.
+    _owner = str(r.get("owner_principal_id") or "").strip()
+    if _owner:
+        out["owner_principal_id"] = _owner
     for key in ("vendor", "display_name", "description", "base_url", "api_key", "output_version"):
         if r.get(key) not in (None, ""):
             out[key] = r[key]
