@@ -158,6 +158,24 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
         run: pnpm run build:desktop:win
 
+      # Thin client: no bundled PyInstaller Gateway / KWS assets (419 MB -> 69 MB).
+      # CARGO_TARGET_DIR keeps its NSIS output out of the Fat installer's bundle
+      # dir, so Collect/Publish below still see exactly one setup.exe.
+      - name: Build Thin client installer (cloud Gateway)
+        working-directory: evopanel
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          CARGO_TARGET_DIR: ${{ github.workspace }}/.build-thin-target
+        run: pnpm run build:desktop:thin
+
+      - name: Upload Thin installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: evoflow-thin-setup-${{ github.run_number }}
+          path: ${{ github.workspace }}/.build-thin-target/release/bundle/nsis/*setup.exe
+          if-no-files-found: error
+          retention-days: 14
+
       - name: Collect artifacts + checksums
         id: artifacts
         shell: pwsh

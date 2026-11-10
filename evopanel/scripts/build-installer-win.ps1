@@ -253,7 +253,10 @@ $OldBackendExe = Join-Path $DeerpanelDir "src-tauri\binaries\backend-gateway.exe
 $OldBackendDir = Join-Path $DeerpanelDir "src-tauri\binaries\backend-gateway"
 $OldBackendV2Dir = Join-Path $DeerpanelDir "src-tauri\binaries\backend-gateway-v2"
 $OldRenamedV2Dir = Join-Path $DeerpanelDir "src-tauri\binaries\evoflow-gateway-v2"
-$BundleDir = Join-Path $DeerpanelDir "src-tauri\target\release\bundle\nsis"
+# Respect CARGO_TARGET_DIR so a Thin build can emit into an isolated target
+# tree without overwriting the Fat installer in the default location.
+$TargetRoot = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { Join-Path $DeerpanelDir "src-tauri\target" }
+$BundleDir = Join-Path $TargetRoot "release\bundle\nsis"
 $FrontendDistDir = Join-Path $DeerpanelDir "dist"
 $PrebuiltFrontendConfig = "src-tauri/tauri.prebuilt-frontend.conf.json"
 $GatewayBuildTempRoot = Join-Path $DeerpanelDir ".build-temp\gateway-build"

@@ -6,8 +6,9 @@
 - 协议：401 探测 → RFC 9728 受保护资源元数据 → RFC 8414/OIDC 授权服务器元数据
   → RFC 7591 动态注册公开客户端 → 授权码 + PKCE(S256) + RFC 8707 resource
   → 换令牌 / refresh_token 续期。
-- 单用户：state 放进程内存（10 分钟 TTL），令牌落本机 JSON 文件；
-  不需要 Redis / 多用户身份 / 加密 state。
+- 单用户：state 与令牌都落共享数据目录（每 state 一个 JSON 文件，10 分钟 TTL），
+  因此 start / callback 可以落在不同 uvicorn worker；不需要 Redis / 多用户身份 /
+  加密 state。跨进程 refresh 仍需单 worker 或分布式锁（见 docker-compose.yaml）。
 - 注入：拿到令牌后直接写进 SQLite 里该 server 的 ``headers.Authorization``，
   复用 EvoFlow 已有的 headers → langchain-mcp-adapters 链路，不改 MCP 加载代码。
 
@@ -41,8 +42,9 @@ REFRESH_MARGIN_SECONDS = 300
 CALLBACK_PATH = '/api/mcp/oauth/callback'
 _PROBE_PROTOCOL = '2025-06-18'
 
-# 回调窗口与状态轮询都在本机，state 不落库、不出进程
-_STATES: dict[str, dict[str, Any]] = {}
+# 云服 uvicorn 可开多 worker：start 与 callback 可能落不同进程。
+# state 改为「每 state 一个 JSON 文件」放在共享数据目录，而不是进程内存；
+# 令牌文件本来就在同一共享卷上。跨进程 refresh 锁仍由部署侧单 worker 约束保证。
 _REFRESH_LOCK = asyncio.Lock()
 
 
@@ -321,8 +323,81 @@ async def refresh(server: OAuthServer, client_id: str, refresh_token: str) -> To
 
 # ---------------------------------------------------------------- 本机状态
 
+def _data_dir() -> Path:
+    """Directory holding OAuth tokens and in-flight state files.
+
+    Desktop history: tokens were always written to ``~/.evoflow/data`` and
+    EVOFLOW_HOME was ignored. Keep that path when an existing token file is
+    present so an in-place upgrade does not invalidate already-authorized MCP
+    connectors.
+
+    Cloud: compose mounts EVOFLOW_HOME as a shared volume. Use the project's
+    canonical resolver so tokens survive container restarts and are visible to
+    every uvicorn worker (it also handles the legacy ``.../workspace/data``
+    double-data layout).
+    """
+    legacy = Path.home() / '.evoflow' / 'data'
+    if (legacy / 'mcp_oauth_tokens.json').exists():
+        return legacy
+    try:
+        from evoflow.config.data_paths import resolve_data_root
+
+        return Path(resolve_data_root())
+    except Exception:
+        logger.warning('MCP OAuth data dir resolver failed, using fallback', exc_info=True)
+        root = os.environ.get('EVOFLOW_HOME', '').strip()
+        base = Path(root) if root else Path.home() / '.evoflow'
+        return base / 'data'
+
+
 def _token_path() -> Path:
-    return Path.home() / '.evoflow' / 'data' / 'mcp_oauth_tokens.json'
+    return _data_dir() / 'mcp_oauth_tokens.json'
+
+
+def _state_dir() -> Path:
+    return _data_dir() / 'mcp_oauth_states'
+
+
+def _state_path(state: str) -> Path:
+    # state comes from secrets.token_urlsafe -> [A-Za-z0-9_-]; sanitize anyway
+    # so a crafted callback value can never escape the state directory.
+    safe = ''.join(ch for ch in state if ch.isalnum() or ch in ('-', '_'))[:128]
+    return _state_dir() / f'{safe}.json'
+
+
+def _save_state(state: str, entry: dict[str, Any]) -> None:
+    directory = _state_dir()
+    directory.mkdir(parents=True, exist_ok=True)
+    path = _state_path(state)
+    tmp = path.with_suffix('.json.tmp')
+    tmp.write_text(json.dumps(entry, ensure_ascii=False), encoding='utf-8')
+    os.replace(tmp, path)
+
+
+def _take_state(state: str) -> dict[str, Any] | None:
+    """Atomically consume a state file so two workers cannot exchange one code twice.
+
+    os.replace() is atomic on the same filesystem; the loser sees no file and
+    gets `None`, which surfaces as a normal "state invalid/expired" error.
+    """
+    path = _state_path(state)
+    if not path.is_file():
+        return None
+    consumed = path.with_suffix('.json.consumed')
+    try:
+        os.replace(path, consumed)
+    except OSError:
+        return None
+    try:
+        data = json.loads(consumed.read_text(encoding='utf-8'))
+        return data if isinstance(data, dict) else None
+    except (OSError, ValueError):
+        return None
+    finally:
+        try:
+            consumed.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def _load_tokens() -> dict[str, Any]:
@@ -373,9 +448,27 @@ def _update_server_headers(name: str, authorization: str | None) -> None:
 
 
 def _purge_expired_states() -> None:
+    directory = _state_dir()
+    if not directory.is_dir():
+        return
     now = time.time()
-    for key in [k for k, v in _STATES.items() if float(v.get('exp') or 0) < now]:
-        _STATES.pop(key, None)
+    for path in directory.iterdir():
+        if not path.is_file():
+            continue
+        try:
+            if path.suffix == '.json':
+                data = json.loads(path.read_text(encoding='utf-8'))
+                expired = float(data.get('exp') or 0) < now
+            else:
+                # .tmp / .consumed leftovers: expire by mtime instead.
+                expired = now - path.stat().st_mtime > STATE_TTL_SECONDS * 2
+        except (OSError, ValueError):
+            expired = True
+        if expired:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 # ---------------------------------------------------------------- 对外流程
@@ -396,20 +489,20 @@ async def start(name: str, url: str, callback_base: str) -> str:
     verifier, challenge = pkce_pair()
     _purge_expired_states()
     state = secrets.token_urlsafe(24)
-    _STATES[state] = {
+    _save_state(state, {
         'name': name,
         'verifier': verifier,
         'redirect_uri': redirect_uri,
         'client_id': client_id,
         'server': server.to_dict(),
         'exp': time.time() + STATE_TTL_SECONDS,
-    }
+    })
     return authorize_url(server, client_id, redirect_uri, state, challenge)
 
 
 async def complete(code: str, state: str) -> str:
     """回调：校验 state → 换令牌 → 落盘 → 写进连接器 headers。"""
-    entry = _STATES.pop(state, None)
+    entry = _take_state(state)
     if not entry or float(entry.get('exp') or 0) < time.time():
         raise OAuthFlowError('授权状态无效或已超时，请重新点「连接」')
     server = OAuthServer.from_dict(entry['server'])

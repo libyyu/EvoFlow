@@ -2,6 +2,7 @@ import asyncio
 import html
 import json
 import logging
+import os
 from typing import Literal
 
 from fastapi import APIRouter, HTTPException, Request
@@ -458,6 +459,35 @@ def _oauth_callback_page(ok: bool, title: str, detail: str, name: str = '') -> H
     )
 
 
+def _oauth_callback_base(request: Request) -> str:
+    """浏览器实际能访问的 Gateway origin，用作 OAuth redirect_uri 前缀。
+
+    桌面端直连 loopback 时 Host 头就够；云服在反向代理后面时 Host 会是内部
+    服务名（如 gateway:8001），拿它当 redirect_uri 授权服务器回调不到。
+
+    优先级：
+      1. EVOFLOW_PUBLIC_BASE_URL（显式配置，最可靠）
+      2. X-Forwarded-Proto / X-Forwarded-Host（需 EVOFLOW_TRUST_PROXY_HEADERS=1，
+         只在受信任反代后面开启；nginx 会用 proxy_set_header 覆盖客户端传的值）
+      3. request.url.scheme + Host（桌面 loopback / 直连）
+    """
+    explicit = os.environ.get('EVOFLOW_PUBLIC_BASE_URL', '').strip().rstrip('/')
+    if explicit:
+        return explicit
+
+    trust_proxy = os.environ.get('EVOFLOW_TRUST_PROXY_HEADERS', '').strip().lower() in (
+        '1', 'true', 'yes', 'on',
+    )
+    if trust_proxy:
+        proto = (request.headers.get('x-forwarded-proto') or '').split(',')[0].strip()
+        fwd_host = (request.headers.get('x-forwarded-host') or '').split(',')[0].strip()
+        if proto in ('http', 'https') and fwd_host:
+            return f'{proto}://{fwd_host}'
+
+    host = request.headers.get('host') or '127.0.0.1:8382'
+    return f'{request.url.scheme}://{host}'
+
+
 @router.post('/mcp/oauth/start', summary='发起 MCP OAuth 连接')
 async def start_mcp_oauth(request: Request, body: McpOAuthStartRequest):
     require_org_admin(request)
@@ -469,9 +499,7 @@ async def start_mcp_oauth(request: Request, body: McpOAuthStartRequest):
     url = str(cfg.get('url') or '').strip()
     if not url:
         raise HTTPException(status_code=400, detail='该连接器没有 URL，只有 http/sse 类型支持 OAuth 授权')
-    # 桌面端 gateway 监听回环地址，Host 就是可直接回调的 loopback origin。
-    host = request.headers.get('host') or '127.0.0.1:8382'
-    callback_base = f'{request.url.scheme}://{host}'
+    callback_base = _oauth_callback_base(request)
     try:
         authorize_url = await oauth_flow.start(body.name, url, callback_base)
     except oauth_flow.OAuthFlowError as exc:

@@ -28,11 +28,12 @@ services:
         APT_MIRROR: ${APT_MIRROR:-}
         UV_IMAGE: ${UV_IMAGE:-ghcr.io/astral-sh/uv:0.7.20}
     container_name: evo-flow-gateway
-    # Workers default to 4 (override via EVOFLOW_GATEWAY_WORKERS in .env).
-    # More workers = more process-level isolation: if one worker's event loop
-    # stalls on a slow graph run, the others keep serving /health and fast
-    # routes. Keep >= 4 in production.
-    command: sh -c "cd backend && PYTHONPATH=. uv run uvicorn app.gateway.app:app --host 0.0.0.0 --port 8001 --workers ${EVOFLOW_GATEWAY_WORKERS:-4} --timeout-keep-alive 30"
+    # Workers default to 1. MCP OAuth state files now live on the shared
+    # EVOFLOW_HOME volume so start/callback work across workers, but the token
+    # refresh lock is still per-process: with >1 worker two processes may
+    # refresh the same token concurrently and hit invalid_grant. Only raise
+    # EVOFLOW_GATEWAY_WORKERS after moving that lock to a shared store.
+    command: sh -c "cd backend && PYTHONPATH=. uv run uvicorn app.gateway.app:app --host 0.0.0.0 --port 8001 --workers ${EVOFLOW_GATEWAY_WORKERS:-1} --timeout-keep-alive 30"
     ports:
       - "127.0.0.1:8001:8001"
     volumes:
@@ -59,6 +60,10 @@ services:
     environment:
       - CI=true
       - EVOFLOW_HOME=/app/backend/.evoflow
+      # Public origin for MCP OAuth redirect_uri. nginx overwrites the
+      # X-Forwarded-* headers, so proxy-header trust is enabled below.
+      - EVOFLOW_PUBLIC_BASE_URL=${EVOFLOW_PUBLIC_BASE_URL:-}
+      - EVOFLOW_TRUST_PROXY_HEADERS=1
       - EVOFLOW_CHANNELS_LANGGRAPH_URL=${EVOFLOW_CHANNELS_LANGGRAPH_URL:-http://langgraph:2024}
       - EVOFLOW_CHANNELS_GATEWAY_URL=${EVOFLOW_CHANNELS_GATEWAY_URL:-http://gateway:8001}
       # DooD path/network translation
