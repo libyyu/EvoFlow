@@ -1279,6 +1279,19 @@ fn ensure_backend_sidecar_inner(app: &tauri::AppHandle) -> Result<(), String> {
         return Ok(());
     }
 
+    // Thin client guard: the P1 bundle intentionally ships no
+    // binaries/evoflow-gateway. Without an external endpoint the old fallthrough
+    // tried the dev-python path and produced a confusing "missing gateway exe".
+    // Fail fast with an actionable message instead.
+    if !prefer_dev_python_sidecar() && resolve_backend_exe_path(app).is_none() {
+        let msg = "未检测到内置 Gateway，也没有配置云服 Gateway 地址。请在「设置 → 远程访问 → 云服 Gateway」填入地址并重启；若需要离线使用，请改用完整安装包。"
+            .to_string();
+        append_startup_log(&format!(
+            "ensure_backend_sidecar error: no bundled sidecar and no external Gateway; {msg}"
+        ));
+        return Err(msg);
+    }
+
     // Per-profile lock: prevents two Tauri windows of the same profile from
     // racing on the same SQLite / port. Cross-profile coexistence is fine —
     // each profile owns its own lock + runtime + port.

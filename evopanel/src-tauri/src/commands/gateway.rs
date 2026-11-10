@@ -537,3 +537,264 @@ pub async fn gateway_health_probe(
 pub async fn gateway_health() -> bool {
     gateway_health_probe(Some("liveness".into()), Some(5000), None).await.ok
 }
+
+// ── Cloud Gateway layered probe (P1-A) ────────────────────────────────
+//
+// A single /health/liveness 200 is NOT proof that a cloud Gateway is usable:
+// docker/nginx/nginx.conf answers unmatched paths with `200 EvoFlow API
+// Gateway. Frontend not deployed.` (plain text), so a misconfigured reverse
+// proxy can look healthy while every /api/* call is swallowed. Each layer
+// below therefore parses JSON and checks the `service` identity.
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayProbeStep {
+    pub key: String,
+    pub label: String,
+    pub ok: bool,
+    /// Hard gate (`true`) vs informational / warming-only (`false`).
+    pub required: bool,
+    pub status: u16,
+    pub detail: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayCloudProbeResponse {
+    pub ok: bool,
+    pub base_url: String,
+    pub service: String,
+    pub steps: Vec<GatewayProbeStep>,
+    pub summary: String,
+}
+
+async fn probe_get(client: &reqwest::Client, url: &str) -> (u16, Option<Value>, String) {
+    match client.get(url).send().await {
+        Ok(resp) => {
+            let status = resp.status().as_u16();
+            let text = resp.text().await.unwrap_or_default();
+            let parsed = serde_json::from_str::<Value>(&text).ok();
+            let preview = text.chars().take(160).collect::<String>().replace('\n', " ");
+            (status, parsed, preview)
+        }
+        Err(e) => (0, None, format!("请求失败: {e}")),
+    }
+}
+
+fn probe_step(
+    key: &str,
+    label: &str,
+    ok: bool,
+    required: bool,
+    status: u16,
+    detail: String,
+) -> GatewayProbeStep {
+    GatewayProbeStep {
+        key: key.to_string(),
+        label: label.to_string(),
+        ok,
+        required,
+        status,
+        detail,
+    }
+}
+
+/// Layered self-check for an external / cloud Gateway. Runs from Rust with
+/// reqwest so it is immune to WebView CORS. `ok` requires every hard gate;
+/// readiness and version are informational (cold start may still be warming).
+#[tauri::command(rename_all = "camelCase")]
+pub async fn gateway_cloud_probe(
+    base_url: Option<String>,
+    timeout_ms: Option<u64>,
+) -> GatewayCloudProbeResponse {
+    let base = base_url
+        .as_deref()
+        .map(|s| s.trim().trim_end_matches('/').to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| backend_base_url().trim_end_matches('/').to_string());
+
+    if base.is_empty() {
+        return GatewayCloudProbeResponse {
+            ok: false,
+            base_url: String::new(),
+            service: String::new(),
+            steps: vec![probe_step(
+                "base",
+                "Gateway 地址",
+                false,
+                true,
+                0,
+                "地址为空".to_string(),
+            )],
+            summary: "Gateway 地址为空".to_string(),
+        };
+    }
+
+    let timeout = Duration::from_millis(timeout_ms.unwrap_or(5000).clamp(500, 15_000));
+    let client = match reqwest::Client::builder().timeout(timeout).build() {
+        Ok(c) => c,
+        Err(e) => {
+            return GatewayCloudProbeResponse {
+                ok: false,
+                base_url: base,
+                service: String::new(),
+                steps: Vec::new(),
+                summary: format!("无法创建 HTTP 客户端: {e}"),
+            }
+        }
+    };
+
+    let mut steps = Vec::new();
+    let service: String;
+    let version: String;
+
+    // 1) Identity — reject reverse-proxy fallback pages / wrong services.
+    {
+        let (status, json, preview) = probe_get(&client, &format!("{base}/health")).await;
+        service = json
+            .as_ref()
+            .and_then(|v| v.get("service"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let state = json
+            .as_ref()
+            .and_then(|v| v.get("status"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let ok = (200..300).contains(&status) && service == "evo-flow-gateway";
+        let detail = if ok {
+            format!("service={service} · status={state}")
+        } else {
+            format!("不是 EvoFlow Gateway（HTTP {status}）：{preview}")
+        };
+        steps.push(probe_step("identity", "服务身份", ok, true, status, detail));
+    }
+
+    // 2) Liveness — process answers and identifies itself on the sync route.
+    {
+        let (status, json, preview) =
+            probe_get(&client, &format!("{base}/health/liveness")).await;
+        let alive = json
+            .as_ref()
+            .and_then(|v| v.get("status"))
+            .and_then(|v| v.as_str())
+            == Some("alive");
+        let svc_ok = json
+            .as_ref()
+            .and_then(|v| v.get("service"))
+            .and_then(|v| v.as_str())
+            == Some("evo-flow-gateway");
+        let ok = (200..300).contains(&status) && alive && svc_ok;
+        let detail = if ok {
+            format!("HTTP {status} · alive · pid={}", json
+                .as_ref()
+                .and_then(|v| v.get("pid"))
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "?".to_string()))
+        } else {
+            format!("探活失败（HTTP {status}）：{preview}")
+        };
+        steps.push(probe_step("liveness", "进程存活", ok, true, status, detail));
+    }
+
+    // 3) Readiness — informational: cold start / LangGraph warm-up is expected.
+    {
+        let (status, json, preview) = probe_get(&client, &format!("{base}/health/ready")).await;
+        let state = json
+            .as_ref()
+            .and_then(|v| v.get("status"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let phase = json
+            .as_ref()
+            .and_then(|v| v.get("phase"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let ok = (200..300).contains(&status);
+        let detail = if ok {
+            format!("HTTP {status} · {state} · phase={phase}")
+        } else {
+            format!("HTTP {status} · {state} · phase={phase} · 仍在预热（不阻断）：{preview}")
+        };
+        steps.push(probe_step("ready", "业务就绪", ok, false, status, detail));
+    }
+
+    // 4) API path — proves the reverse proxy forwards /api/* to the Gateway.
+    //    200 must be JSON: nginx's root fallback is 200 *plain text*.
+    //    401/403 is fine too: the route exists and WebUI auth is enforced.
+    {
+        let (status, json, preview) =
+            probe_get(&client, &format!("{base}/api/mcp/config")).await;
+        let ok = match status {
+            200..=299 => json.is_some(),
+            401 | 403 => true,
+            _ => false,
+        };
+        let detail = match status {
+            200..=299 if json.is_some() => format!("HTTP {status} · /api/ 已放行，配置接口返回 JSON"),
+            200..=299 => format!("HTTP {status} 但响应不是 JSON，疑似反代兜底页：{preview}"),
+            401 | 403 => format!("HTTP {status} · /api/ 已放行且鉴权生效（前端需登录）"),
+            404 | 405 => format!("HTTP {status} · 反代未放行 /api/mcp/*，需要补 nginx location"),
+            _ => format!("HTTP {status} · /api/ 不可达：{preview}"),
+        };
+        steps.push(probe_step("api", "业务 API", ok, true, status, detail));
+    }
+
+    // 5) Version — informational. OpenAPI schema generation can be slow (and
+    //    frozen gateways may disable docs entirely), so cap it independently
+    //    instead of letting it stall the whole self-check.
+    {
+        let version_url = format!("{base}/openapi.json");
+        let (status, json, _) = match tokio::time::timeout(
+            Duration::from_millis(2000),
+            probe_get(&client, &version_url),
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(_) => (0, None, String::new()),
+        };
+        version = json
+            .as_ref()
+            .and_then(|v| v.get("info"))
+            .and_then(|v| v.get("version"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let ok = !version.is_empty();
+        let detail = if ok {
+            format!("HTTP {status} · Gateway API {version}")
+        } else {
+            format!("HTTP {status} · 未取到版本号（不影响连接）")
+        };
+        steps.push(probe_step("version", "版本信息", ok, false, status, detail));
+    }
+
+    let failed: Vec<&str> = steps
+        .iter()
+        .filter(|s| s.required && !s.ok)
+        .map(|s| s.label.as_str())
+        .collect();
+    let ok = failed.is_empty();
+    let summary = if ok {
+        format!(
+            "云服 Gateway 可用{}{}",
+            if service.is_empty() { String::new() } else { format!("（{service}）") },
+            if version.is_empty() { String::new() } else { format!(" · v{version}") },
+        )
+    } else {
+        format!("未通过：{}", failed.join("、"))
+    };
+
+    GatewayCloudProbeResponse {
+        ok,
+        base_url: base,
+        service,
+        steps,
+        summary,
+    }
+}

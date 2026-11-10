@@ -374,6 +374,7 @@ pub fn run() {
             gateway::gateway_proxy_stream,
             gateway::gateway_health,
             gateway::gateway_health_probe,
+            gateway::gateway_cloud_probe,
             // 桌面 app-server 管道（对话）
             app_server::app_server_ensure,
             app_server::app_server_request,

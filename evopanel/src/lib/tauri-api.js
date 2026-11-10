@@ -1866,6 +1866,19 @@ export const api = {
       baseUrl: String(result?.baseUrl || ''),
     }
   },
+  /** P1-A: 云服分层自检（服务身份 / 存活 / 就绪 / 业务 API / 版本）。 */
+  probeGatewaySuite: async (baseUrl, timeoutMs = 5000) => {
+    const result = await invoke('gateway_cloud_probe', {
+      timeoutMs: Math.max(500, Number(timeoutMs) || 5000),
+      baseUrl: String(baseUrl || '').trim().replace(/\/+$/, ''),
+    })
+    return {
+      ok: !!(result && result.ok),
+      summary: String(result?.summary || ''),
+      service: String(result?.service || ''),
+      steps: Array.isArray(result?.steps) ? result.steps : [],
+    }
+  },
   // 测试模型连接（轻量 /models/test，不走 /models/invoke，不强制应用配置）
   testModel: async (baseUrl, apiKey, modelId, apiType = null, configName = null) => {
     const body = {

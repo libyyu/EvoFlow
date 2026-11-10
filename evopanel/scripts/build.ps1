@@ -1,12 +1,14 @@
 # EvoPanel build script (Windows). ASCII-only for PS 5.1 + cmd compatibility.
 # Usage:
 #   .\scripts\build.ps1           Release installer (calls build-installer-win.ps1)
+#   .\scripts\build.ps1 -Thin     Thin client (cloud Gateway, no bundled backend sidecar)
 #   .\scripts\build.ps1 -Debug    Debug build, no NSIS
 #   .\scripts\build.ps1 -Clean    cargo clean then release
 
 param(
     [switch]$Debug,
-    [switch]$Clean
+    [switch]$Clean,
+    [switch]$Thin
 )
 
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
@@ -84,7 +86,11 @@ if ($Debug) {
     Write-Step "Debug build (no installer)"
     npm run tauri build -- --debug
 } else {
-    Write-Step "Release build (backend sidecar + NSIS)"
+    if ($Thin) {
+        Write-Step "Release build (THIN client: cloud Gateway, no bundled backend)"
+    } else {
+        Write-Step "Release build (backend sidecar + NSIS)"
+    }
     Write-Host "  Uses build-installer-win.ps1: backend -> binaries -> NSIS" -ForegroundColor DarkGray
     Write-Host ""
     $installerScript = Join-Path $PSScriptRoot "build-installer-win.ps1"
@@ -94,7 +100,11 @@ if ($Debug) {
             & powershell -NoProfile -ExecutionPolicy Bypass -File $verifyAscii $installerScript $verifyAscii
             if ($LASTEXITCODE -ne 0) { Write-Fail "PowerShell scripts must be ASCII-only (see verify-ps1-ascii.ps1)"; exit 1 }
         }
-        & powershell -NoProfile -ExecutionPolicy Bypass -File $installerScript
+        if ($Thin) {
+            & powershell -NoProfile -ExecutionPolicy Bypass -File $installerScript -GatewayMode Thin
+        } else {
+            & powershell -NoProfile -ExecutionPolicy Bypass -File $installerScript
+        }
         if ($LASTEXITCODE -ne 0) {
             Write-Fail "build-installer-win.ps1 failed"
             exit 1

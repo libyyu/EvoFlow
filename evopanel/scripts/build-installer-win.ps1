@@ -1,5 +1,7 @@
 # EvoPanel Windows installer build. ASCII-only strings for PS 5.1 (CI uses system ANSI, not UTF-8).
 param(
+  [ValidateSet('Fat', 'Thin')]
+  [string]$GatewayMode = 'Fat',
   [switch]$SkipBackendBuild,
   [switch]$SkipBundleBuild,
   [switch]$NoParallel
@@ -85,7 +87,34 @@ function Set-UpdaterSigningEnv([string]$ProjectDir) {
   return $true
 }
 
-function Invoke-TauriBundleBuild([string]$ProjectDir, [string]$TauriConfig = "") {
+function New-ThinTauriConfig([string]$ProjectDir) {
+  # Emit a FULL config instead of a partial overlay: Tauri merges --config on
+  # top of tauri.conf.json and the array-merge semantics are not guaranteed.
+  # Writing every key makes the effective resource list deterministic.
+  $main = Join-Path $ProjectDir "src-tauri\tauri.conf.json"
+  if (-not (Test-Path -LiteralPath $main)) {
+    throw "Main Tauri config missing: $main"
+  }
+  $outDir = Join-Path $ProjectDir ".build-temp\config"
+  New-Item -ItemType Directory -Path $outDir -Force | Out-Null
+  $out = Join-Path $outDir "tauri.thin.generated.json"
+  $cfg = Get-Content -LiteralPath $main -Raw -Encoding UTF8 | ConvertFrom-Json
+  $keep = @()
+  foreach ($r in @($cfg.bundle.resources)) {
+    $s = [string]$r
+    # Thin client owns no backend: drop the PyInstaller sidecar and wake-word assets.
+    if ($s -match 'evoflow-gateway|kws-sidecar|public[\\/]kws') { continue }
+    $keep += $s
+  }
+  $cfg.bundle.resources = @($keep)
+  $json = $cfg | ConvertTo-Json -Depth 100
+  [System.IO.File]::WriteAllText($out, $json, (New-Object System.Text.UTF8Encoding($false)))
+  Write-Step "thin config: $out"
+  Write-Step "thin resources: $($keep -join ', ')"
+  return $out
+}
+
+function Invoke-TauriBundleBuild([string]$ProjectDir, [string[]]$TauriConfig = @()) {
   $signEnabled = Set-UpdaterSigningEnv -ProjectDir $ProjectDir
   $localTemp = Join-Path $ProjectDir ".build-temp"
   $localNpmCache = Join-Path $localTemp "npm-cache"
@@ -115,8 +144,8 @@ function Invoke-TauriBundleBuild([string]$ProjectDir, [string]$TauriConfig = "")
     # Call CLI directly. Use --config=path (one arg): separate --config + path is forwarded to cargo on Windows.
     $tauriArgs = @("build")
     $configFiles = @()
-    if ($TauriConfig) {
-      $configFiles += $TauriConfig
+    foreach ($cfg in $TauriConfig) {
+      if ($cfg) { $configFiles += $cfg }
     }
     if (-not $signEnabled) {
       $configFiles += "src-tauri/tauri.ci-nosign.conf.json"
@@ -230,7 +259,12 @@ $PrebuiltFrontendConfig = "src-tauri/tauri.prebuilt-frontend.conf.json"
 $GatewayBuildTempRoot = Join-Path $DeerpanelDir ".build-temp\gateway-build"
 $BuildStart = Get-Date
 
-$useParallel = (-not $NoParallel) -and (-not $SkipBackendBuild) -and (-not $SkipBundleBuild)
+$useParallel = (-not $NoParallel) -and (-not $SkipBackendBuild) -and (-not $SkipBundleBuild) -and ($GatewayMode -eq 'Fat')
+if ($GatewayMode -eq 'Thin') {
+  Write-Step "gateway mode: Thin (no local backend sidecar; desktop connects to a cloud Gateway)"
+} else {
+  Write-Step "gateway mode: Fat (bundled PyInstaller gateway + wake-word assets)"
+}
 
 function Get-DriveFreeGb([string]$Path) {
   $root = [System.IO.Path]::GetPathRoot($Path)
@@ -296,33 +330,39 @@ if (Test-Path $OldRenamedV2Dir) {
 if ($useParallel) {
   Invoke-ParallelBackendAndFrontend -BackendBuildScript $BackendBuildScript -BackendOutputDir $BackendOutputDir -ProjectDir $DeerpanelDir -BackendBuildTempRoot $GatewayBuildTempRoot
 } else {
-  if (-not $SkipBackendBuild) {
+  if ((-not $SkipBackendBuild) -and ($GatewayMode -eq 'Fat')) {
     Write-Step "building backend sidecar"
     & $BackendBuildScript -OutputPath $BackendOutputDir -BuildTempRoot $GatewayBuildTempRoot
+  } elseif ($GatewayMode -eq 'Thin') {
+    Write-Step "thin mode: skip backend sidecar build"
   }
 }
 
-if (!(Test-Path $BackendOutputDir)) {
-  throw "Backend output dir not found: $BackendOutputDir"
-}
+if ($GatewayMode -eq 'Fat') {
+  if (!(Test-Path $BackendOutputDir)) {
+    throw "Backend output dir not found: $BackendOutputDir"
+  }
 
-# Even with -SkipBackendBuild, refuse to NSIS-pack a fat/stale sidecar.
-$LeanAssert = Join-Path $RepoRoot "backend\packaging\windows\assert-lean-gateway-bundle.ps1"
-Write-Step "assert lean gateway sidecar (no Chromium/torch unless explicitly opted in)"
-& $LeanAssert -GatewayDir $BackendOutputDir
+  # Even with -SkipBackendBuild, refuse to NSIS-pack a fat/stale sidecar.
+  $LeanAssert = Join-Path $RepoRoot "backend\packaging\windows\assert-lean-gateway-bundle.ps1"
+  Write-Step "assert lean gateway sidecar (no Chromium/torch unless explicitly opted in)"
+  & $LeanAssert -GatewayDir $BackendOutputDir
 
-$ManifestPath = Join-Path $BackendOutputDir "sidecar-manifest.json"
-$ExpectedVer = (Get-Content -LiteralPath (Join-Path $DeerpanelDir "VERSION") -Raw).Trim()
-if (-not (Test-Path -LiteralPath $ManifestPath)) {
-  Write-Step "sidecar-manifest missing; writing from evopanel/VERSION"
-  & (Join-Path $RepoRoot "backend\packaging\windows\write-sidecar-manifest.ps1") -GatewayDir $BackendOutputDir
+  $ManifestPath = Join-Path $BackendOutputDir "sidecar-manifest.json"
+  $ExpectedVer = (Get-Content -LiteralPath (Join-Path $DeerpanelDir "VERSION") -Raw).Trim()
+  if (-not (Test-Path -LiteralPath $ManifestPath)) {
+    Write-Step "sidecar-manifest missing; writing from evopanel/VERSION"
+    & (Join-Path $RepoRoot "backend\packaging\windows\write-sidecar-manifest.ps1") -GatewayDir $BackendOutputDir
+  }
+  $manifestObj = Get-Content -LiteralPath $ManifestPath -Raw | ConvertFrom-Json
+  $manifestVer = [string]$manifestObj.panel_version
+  if ($manifestVer -ne $ExpectedVer) {
+    throw "sidecar-manifest panel_version='$manifestVer' != evopanel/VERSION='$ExpectedVer' (rebuild sidecar or re-run write-sidecar-manifest)"
+  }
+  Write-Step "sidecar pin ok: panel_version=$manifestVer"
+} else {
+  Write-Step "thin mode: skip lean assert and sidecar manifest pin (no sidecar to pack)"
 }
-$manifestObj = Get-Content -LiteralPath $ManifestPath -Raw | ConvertFrom-Json
-$manifestVer = [string]$manifestObj.panel_version
-if ($manifestVer -ne $ExpectedVer) {
-  throw "sidecar-manifest panel_version='$manifestVer' != evopanel/VERSION='$ExpectedVer' (rebuild sidecar or re-run write-sidecar-manifest)"
-}
-Write-Step "sidecar pin ok: panel_version=$manifestVer"
 
 if (-not $SkipBundleBuild) {
   if (-not $useParallel) {
@@ -335,15 +375,18 @@ if (-not $SkipBundleBuild) {
     if ($useParallel -and !(Test-Path $FrontendDistDir)) {
       throw "Frontend dist not found after parallel build: $FrontendDistDir"
     }
-    $tauriConfig = ""
+    $configOverlays = @()
     if ($useParallel) {
-      $tauriConfig = $PrebuiltFrontendConfig
+      $configOverlays += $PrebuiltFrontendConfig
     }
-    $buildExitCode = Invoke-TauriBundleBuild -ProjectDir $DeerpanelDir -TauriConfig $tauriConfig
+    if ($GatewayMode -eq 'Thin') {
+      $configOverlays += (New-ThinTauriConfig -ProjectDir $DeerpanelDir)
+    }
+    $buildExitCode = Invoke-TauriBundleBuild -ProjectDir $DeerpanelDir -TauriConfig $configOverlays
     if ($buildExitCode -ne 0) {
       Write-Step "desktop installer build failed once (exit=$buildExitCode), retrying..."
       Start-Sleep -Seconds 2
-      $buildExitCode = Invoke-TauriBundleBuild -ProjectDir $DeerpanelDir -TauriConfig $tauriConfig
+      $buildExitCode = Invoke-TauriBundleBuild -ProjectDir $DeerpanelDir -TauriConfig $configOverlays
     }
     if ($buildExitCode -ne 0) {
       throw "Desktop installer build failed with exit code: $buildExitCode (if ENOSPC, free C drive or keep building from D drive workspace)"

@@ -32,8 +32,8 @@ let _qrData = null
 let _qrRefreshTimer = null
 /** @type {any | null} P0: get_gateway_endpoint() 返回值；null = 尚未加载 / 非桌面端 */
 let _gatewayEndpoint = null
-/** @type {{ msg: string, kind: 'info'|'ok'|'bad' }} P0: 探测/保存结果行 */
-let _gatewayProbe = { msg: '', kind: 'info' }
+/** @type {{ msg: string, kind: 'info'|'ok'|'bad', steps: any[] }} 云服 Gateway 探测结果 */
+let _gatewayProbe = { msg: '', kind: 'info', steps: [] }
 
 function isDesktop() {
   return !!window.__TAURI_INTERNALS__
@@ -267,7 +267,7 @@ function cloudGatewaySectionHtml() {
       <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 10h-1.26A8 8 0 109 20h9a5 5 0 000-10z"/><path d="M12 13v4M10 15h4"/></svg>
       云服 Gateway
     </div>
-    <p class="form-hint">把桌面端指向部署在云服的 Gateway。优先级：进程环境变量 &gt; 此处保存的配置 &gt; 本地 sidecar。P0 只改连接地址，本地 Gateway 进程仍会启动；P1 瘦包才会移除。</p>
+    <p class="form-hint">把桌面端指向部署在云服的 Gateway。优先级：进程环境变量 &gt; 此处保存的配置 &gt; 本地 sidecar。<b>连接自检</b>逐层校验服务身份、进程存活、业务就绪、/api/ 反代放行与版本，避免「探活 200 但业务 API 全被反代吞掉」的假阳性。P0 只改连接地址，本地 Gateway 进程仍会启动；P1 瘦包才会移除。</p>
 
     <div id="remote-gateway-state">${gatewayStateHtml()}</div>
 
@@ -278,11 +278,12 @@ function cloudGatewaySectionHtml() {
     </label>
 
     <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
-      <button type="button" class="cron-btn sm" id="remote-gateway-test-btn">测试连接</button>
+      <button type="button" class="cron-btn sm" id="remote-gateway-test-btn">连接自检</button>
       <button type="button" class="cron-btn sm primary" id="remote-gateway-save-btn">保存</button>
       <button type="button" class="cron-btn sm" id="remote-gateway-clear-btn">清除并恢复本地</button>
     </div>
     <p id="remote-gateway-result" style="margin:8px 0 0;font-size:12px;min-height:16px;color:${probeColor}">${escHtml(_gatewayProbe.msg)}</p>
+    <div id="remote-gateway-steps">${gatewayStepsHtml(_gatewayProbe.steps)}</div>
     <p class="form-hint" style="margin:6px 0 0">保存后前端请求地址立即切换；<b>重启 EvoFlow</b> 才会跳过本地 Gateway / LangGraph 进程的启动。若「当前来源」是环境变量，保存配置文件不会立即生效，需先移除该环境变量。</p>
   </div>`
 }
@@ -293,14 +294,34 @@ function refreshGatewayState(root) {
   if (slot) slot.innerHTML = gatewayStateHtml()
 }
 
-function setGatewayProbe(root, msg, kind = 'info') {
-  _gatewayProbe = { msg: String(msg || ''), kind }
+function gatewayStepsHtml(steps) {
+  if (!Array.isArray(steps) || !steps.length) return ''
+  return `<div style="margin:2px 0 0;padding:8px 10px;border:1px solid var(--border-color,#333);border-radius:8px;display:flex;flex-direction:column;gap:5px">${steps.map((s) => {
+    const color = s.ok
+      ? 'var(--success,#16a34a)'
+      : s.required ? 'var(--error,#ef4444)' : 'var(--warning,#ca8a04)'
+    const icon = s.ok ? '✓' : s.required ? '✕' : '!'
+    const status = s.status ? ` <span style="opacity:.65">HTTP ${escHtml(s.status)}</span>` : ''
+    return `
+      <div style="display:flex;gap:6px;font-size:12px;align-items:flex-start">
+        <span style="color:${color};min-width:12px">${icon}</span>
+        <span style="color:var(--text-muted,#888);min-width:60px;flex-shrink:0">${escHtml(s.label)}</span>
+        <span style="flex:1;word-break:break-all">${escHtml(s.detail || '')}${status}</span>
+      </div>`
+  }).join('')}</div>`
+}
+
+function setGatewayProbe(root, msg, kind = 'info', steps = []) {
+  _gatewayProbe = { msg: String(msg || ''), kind, steps: Array.isArray(steps) ? steps : [] }
   const line = root?.querySelector('#remote-gateway-result')
-  if (!line) return
-  line.textContent = _gatewayProbe.msg
-  line.style.color = kind === 'ok'
-    ? 'var(--success,#16a34a)'
-    : kind === 'bad' ? 'var(--error,#ef4444)' : 'var(--text-muted,#888)'
+  if (line) {
+    line.textContent = _gatewayProbe.msg
+    line.style.color = kind === 'ok'
+      ? 'var(--success,#16a34a)'
+      : kind === 'bad' ? 'var(--error,#ef4444)' : 'var(--text-muted,#888)'
+  }
+  const slot = root?.querySelector('#remote-gateway-steps')
+  if (slot) slot.innerHTML = gatewayStepsHtml(_gatewayProbe.steps)
 }
 
 function modalHtml(title, fields, btnId, btnLabel, extraHtml = '') {
@@ -430,15 +451,24 @@ function wireEvents(root) {
       setGatewayProbe(root, '请先填写 Gateway 地址', 'bad')
       return
     }
-    setGatewayProbe(root, `正在探测 ${url}/health/liveness …`)
+    const btn = root.querySelector('#remote-gateway-test-btn')
+    const prevLabel = btn?.textContent || '连接自检'
+    if (btn) {
+      btn.disabled = true
+      btn.textContent = '自检中…'
+    }
+    setGatewayProbe(root, `正在分层自检 ${url} …`)
     try {
       const { api } = await import('../../lib/tauri-api.js')
-      const r = await api.probeGatewayEndpoint(url, 5000)
-      setGatewayProbe(root,
-        r.ok ? `连接成功（HTTP ${r.status || 200}）：${url}` : `连接失败（HTTP ${r.status || 0}）：${url}`,
-        r.ok ? 'ok' : 'bad')
+      const r = await api.probeGatewaySuite(url, 6000)
+      setGatewayProbe(root, r.summary || (r.ok ? '自检通过' : '自检未通过'), r.ok ? 'ok' : 'bad', r.steps)
     } catch (err) {
-      setGatewayProbe(root, `探测失败：${err?.message || err}`, 'bad')
+      setGatewayProbe(root, `自检失败：${err?.message || err}`, 'bad')
+    } finally {
+      if (btn) {
+        btn.disabled = false
+        btn.textContent = prevLabel
+      }
     }
   })
 
@@ -635,7 +665,7 @@ export function cleanup() {
   _initialPassword = null
   _qrData = null
   _gatewayEndpoint = null
-  _gatewayProbe = { msg: '', kind: 'info' }
+  _gatewayProbe = { msg: '', kind: 'info', steps: [] }
   if (_qrRefreshTimer) {
     clearTimeout(_qrRefreshTimer)
     _qrRefreshTimer = null

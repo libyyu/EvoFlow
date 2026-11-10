@@ -29,6 +29,7 @@
     "check:macos12:dist": "python scripts/check-macos12-compat.py --dist dist",
     "build:tauri": "node scripts/run-platform-script.js build",
     "build:desktop:win": "powershell -NoProfile -ExecutionPolicy Bypass -File ./scripts/build.ps1",
+    "build:desktop:thin": "powershell -NoProfile -ExecutionPolicy Bypass -File ./scripts/build.ps1 -Thin",
     "build:desktop:mac": "bash ./scripts/build-installer-mac.sh",
     "build:debug": "node scripts/run-platform-script.js build --debug",
     "build:clean": "node scripts/run-platform-script.js build --clean",
