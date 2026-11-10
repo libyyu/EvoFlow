@@ -2,6 +2,8 @@
  * 智能体中心 — 技能 / 连接器共用 UI 片段（抽屉、筛选栏、二级 Tab）
  */
 
+import { enhanceSelectsIn } from '../lib/ef-dropdown-select.js'
+
 export function esc(str) {
   if (!str) return ''
   return String(str)
@@ -68,6 +70,9 @@ export function openDrawer(page, { title, subtitle = '', body = '', foot = '', m
   root.querySelector('[data-role="title"]').textContent = title || '详情'
   root.querySelector('[data-role="subtitle"]').innerHTML = subtitle || ''
   root.querySelector('[data-role="body"]').innerHTML = body || ''
+  // 抽屉里的原生 <select> 也要走统一的自定义下拉增强（与 modal 一致），
+  // 否则 WebView 原生弹层可能只渲染首项。全局 MutationObserver 兜底不可靠，这里显式增强。
+  enhanceSelectsIn(root)
   const footEl = root.querySelector('[data-role="foot"]')
   footEl.innerHTML = foot
     ? `<div class="ef-side-drawer__actions">${foot}</div>`

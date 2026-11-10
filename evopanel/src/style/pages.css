@@ -1890,7 +1890,8 @@ html.dark .config-section-title {
   transition: background-color $1, border-color $1, color $1, opacity $1, transform $1, box-shadow $1;
 }
 .skill-card:hover .skill-delete-btn,
-.mcp-server-card:hover .skill-delete-btn {
+.mcp-server-card:hover .skill-delete-btn,
+.mcp-server-row:hover .skill-delete-btn {
   opacity: 1;
   pointer-events: auto;
   background: rgba(239,68,68,.08);
