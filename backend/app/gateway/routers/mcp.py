@@ -1,8 +1,11 @@
 import asyncio
+import html
+import json
 import logging
 from typing import Literal
 
 from fastapi import APIRouter, HTTPException, Request
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
 from evoflow.authz.http_guard import require_org_admin
@@ -152,6 +155,22 @@ async def get_mcp_configuration(request: Request) -> McpConfigResponse:
     require_org_admin(request)
     from evoflow.config.extensions_config import ExtensionsConfig, reload_extensions_config
     from evoflow.mcp.status import build_mcp_status_snapshot
+
+    # 页面每 4 秒轮询这里，顺带续期即将过期的 OAuth 用户令牌。
+    # 必须 fire-and-forget：令牌端点最长 15 秒超时，同步 await 会把状态接口
+    # 拖住，整个连接器页面会跟着卡；失败也绝不能影响状态读取。
+    try:
+        from evoflow.mcp import oauth_flow
+
+        async def _oauth_refresh_sweep() -> None:
+            try:
+                await oauth_flow.refresh_all_expiring()
+            except Exception as exc:
+                logger.debug("MCP OAuth refresh sweep failed: %s", exc)
+
+        asyncio.create_task(_oauth_refresh_sweep())
+    except Exception as exc:
+        logger.debug("MCP OAuth refresh sweep skipped: %s", exc)
 
     try:
         # May import ~/.cursor/mcp.json into SQLite when DB is empty or corrupt
@@ -391,3 +410,117 @@ async def resolve_mcp_market_install(
         logger.error("MCP market install resolve failed: %s", e, exc_info=True)
         detail = str(e).strip() or repr(e)
         raise HTTPException(status_code=502, detail=f"Failed to resolve MCP install config: {detail}") from e
+
+
+# ---------------------------------------------------------------------------
+# MCP OAuth 2.1（授权码 + PKCE）——协议与状态在 evoflow.mcp.oauth_flow
+# 回调是浏览器普通 GET，不带登录态，故此处不挂 require_org_admin。
+# ---------------------------------------------------------------------------
+
+class McpOAuthStartRequest(BaseModel):
+    name: str = Field(..., description="连接器名称")
+
+
+_OAUTH_CALLBACK_PAGE = """<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><title>EvoFlow · MCP 授权</title>
+<style>
+body{font-family:system-ui,sans-serif;display:flex;align-items:center;justify-content:center;height:90vh;color:#303133;background:#f7f8fa}
+.box{text-align:center;max-width:460px;padding:28px;border-radius:14px;background:#fff;box-shadow:0 12px 40px rgba(0,0,0,.08)}
+h3{color:__COLOR__;margin:0 0 12px}p{color:#606266;line-height:1.7}
+</style></head><body><div class="box"><h3>__TITLE__</h3><p>__DETAIL__</p><p style="font-size:12px;color:#909399">__HINT__</p></div>
+<script>
+(function(){
+  var data = __PAYLOAD__;
+  try { if (window.opener) window.opener.postMessage(data, '*'); } catch(e) {}
+  __CLOSE__
+})();
+</script></body></html>"""
+
+
+def _oauth_callback_page(ok: bool, title: str, detail: str, name: str = '') -> HTMLResponse:
+    payload = json.dumps(
+        {'type': 'evoflow-mcp-oauth', 'ok': ok, 'name': name, 'message': detail},
+        ensure_ascii=False,
+    ).replace('<', '\\u003c')
+    page = (
+        _OAUTH_CALLBACK_PAGE
+        .replace('__COLOR__', '#16a34a' if ok else '#dc2626')
+        .replace('__TITLE__', html.escape(title))
+        .replace('__DETAIL__', html.escape(detail))
+        .replace('__HINT__', html.escape('可以关闭此窗口，回到 EvoFlow 的连接器页面' if ok else '请回到 EvoFlow 重新点「连接」'))
+        .replace('__PAYLOAD__', payload)
+        .replace('__CLOSE__', 'setTimeout(function(){ window.close(); }, 1200);' if ok else '')
+    )
+    return HTMLResponse(
+        page,
+        status_code=200 if ok else 400,
+        headers={'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer'},
+    )
+
+
+@router.post('/mcp/oauth/start', summary='发起 MCP OAuth 连接')
+async def start_mcp_oauth(request: Request, body: McpOAuthStartRequest):
+    require_org_admin(request)
+    from evoflow.mcp import oauth_flow
+    from evoflow.persistence import config_repositories as cfg_repo
+
+    servers = await asyncio.to_thread(cfg_repo.list_mcp_servers)
+    cfg = servers.get(body.name) if isinstance(servers.get(body.name), dict) else {}
+    url = str(cfg.get('url') or '').strip()
+    if not url:
+        raise HTTPException(status_code=400, detail='该连接器没有 URL，只有 http/sse 类型支持 OAuth 授权')
+    # 桌面端 gateway 监听回环地址，Host 就是可直接回调的 loopback origin。
+    host = request.headers.get('host') or '127.0.0.1:8382'
+    callback_base = f'{request.url.scheme}://{host}'
+    try:
+        authorize_url = await oauth_flow.start(body.name, url, callback_base)
+    except oauth_flow.OAuthFlowError as exc:
+        raise HTTPException(status_code=400, detail=exc.message) from None
+    return {
+        'authorize_url': authorize_url,
+        'redirect_uri': callback_base.rstrip('/') + oauth_flow.CALLBACK_PATH,
+    }
+
+
+@router.get('/mcp/oauth/callback', include_in_schema=False, summary='MCP OAuth 授权回调')
+async def mcp_oauth_callback(
+    code: str = '',
+    state: str = '',
+    error: str = '',
+    error_description: str = '',
+):
+    from evoflow.mcp import oauth_flow
+
+    if error:
+        reason = error_description or error
+        return _oauth_callback_page(False, '授权没有完成', '你取消了授权' if error == 'access_denied' else f'授权服务器返回：{reason}')
+    if not code or not state:
+        return _oauth_callback_page(False, '回调缺少参数', '请回到 EvoFlow 重新点「连接」')
+    try:
+        name = await oauth_flow.complete(code, state)
+    except oauth_flow.OAuthFlowError as exc:
+        return _oauth_callback_page(False, '连接失败', exc.message)
+    except Exception as exc:
+        logger.error("MCP OAuth callback failed: %s", exc, exc_info=True)
+        return _oauth_callback_page(False, '连接失败', str(exc))
+    return _oauth_callback_page(True, '连接成功', f'连接器「{name}」已完成授权，工具清单正在刷新', name)
+
+
+@router.get('/mcp/oauth/status', summary='查询 MCP OAuth 连接状态')
+async def mcp_oauth_status(request: Request, name: str = ''):
+    require_org_admin(request)
+    from evoflow.mcp import oauth_flow
+
+    return oauth_flow.connection_status(name)
+
+
+@router.delete('/mcp/oauth', summary='断开 MCP OAuth 连接')
+async def disconnect_mcp_oauth(request: Request, name: str = ''):
+    require_org_admin(request)
+    from evoflow.mcp import oauth_flow
+
+    try:
+        await asyncio.to_thread(oauth_flow.disconnect, name)
+    except oauth_flow.OAuthFlowError as exc:
+        raise HTTPException(status_code=400, detail=exc.message) from None
+    return {'ok': True}

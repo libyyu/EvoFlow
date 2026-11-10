@@ -3097,6 +3097,10 @@ export const api = {
   // MCP 工具 API
   getMCPConfig: async () => gatewayProxy('GET', '/mcp/config'),
   updateMCPConfig: async (mcpServers) => gatewayProxy('PUT', '/mcp/config', { mcp_servers: mcpServers }),
+  // MCP OAuth 2.1（授权码 + PKCE）：授权窗口回到网关 loopback 回调后由网关保存令牌
+  mcpOAuthStart: async (name) => gatewayProxy('POST', '/mcp/oauth/start', { name }),
+  mcpOAuthStatus: async (name) => gatewayProxy('GET', '/mcp/oauth/status', null, { name }),
+  mcpOAuthDisconnect: async (name) => gatewayProxy('DELETE', '/mcp/oauth', null, { name }),
 
   // 工具元数据（内置工具列表 + MCP服务器 + Skills，用于 Agent 配置 UI）
   getToolsMetadata: () => cachedGateway('GET', '/tools/metadata'),

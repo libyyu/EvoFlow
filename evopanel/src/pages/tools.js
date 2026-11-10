@@ -385,6 +385,7 @@ function renderConnectorCard(name, config, toolCount, runtimeStatus) {
         <button type="button" class="btn btn-secondary btn-sm" data-act="test">测试连接</button>
         <button type="button" class="btn btn-secondary btn-sm" data-act="config">配置</button>
         <button type="button" class="btn btn-secondary btn-sm" data-act="logs">查看日志</button>
+        ${config.url ? '<button type="button" class="btn btn-secondary btn-sm" data-act="oauth">OAuth 连接</button>' : ''}
         <label class="mcp-row-toggle" title="${enabled ? '停用' : '启用'}">
           <input type="checkbox" class="mcp-toggle" data-name="${esc(name)}" ${enabled ? 'checked' : ''}>
           <span class="mcp-toggle-track"><span class="mcp-toggle-thumb"></span></span>
@@ -447,6 +448,60 @@ function bindInstalledEvents(page, contentEl, data) {
         foot: `<button type="button" class="btn btn-secondary" data-act="close">关闭</button>`,
       })
       page.querySelector('#ecDrawer [data-act="close"]')?.addEventListener('click', () => closeDrawer(page))
+    })
+
+    card.querySelector('[data-act="oauth"]')?.addEventListener('click', async (e) => {
+      e.stopPropagation()
+      const btn = e.currentTarget
+      const isDesktop = !!window.__TAURI_INTERNALS__
+      // Web 模式必须在点击回调里同步开窗：await 之后再 window.open 会被浏览器拦截。
+      // 桌面端走 Tauri shell，用系统浏览器打开；不要在 WebView2 里多开空白窗口。
+      const win = isDesktop ? null : window.open('', '_blank')
+      setBtnState(btn, 'loading', { loading: '连接中…', idle: 'OAuth 连接' })
+      try {
+        const res = await api.mcpOAuthStart(name)
+        const url = res?.authorize_url || res?.data?.authorize_url
+        if (!url) throw new Error('未返回授权地址')
+        if (isDesktop) {
+          try {
+            // 系统浏览器通常已有企业 SSO 登录态，WebView2 新窗口则要重新登录一遍。
+            const { open } = await import('@tauri-apps/plugin-shell')
+            await open(url)
+          } catch {
+            window.open(url, '_blank', 'noopener,noreferrer')
+          }
+        } else if (win) {
+          win.location.href = url
+        } else {
+          window.open(url, '_blank', 'noopener,noreferrer')
+        }
+        // 授权窗口会回到网关的 loopback 回调，令牌由后端保存；这里轮询状态即可。
+        for (let i = 0; i < 60; i += 1) {
+          await new Promise((r) => setTimeout(r, 1500))
+          let st
+          try {
+            st = await api.mcpOAuthStatus(name)
+          } catch {
+            // 网关重载/重启时状态接口可能短暂 503，别把一次成功的授权误判成失败。
+            continue
+          }
+          if (st?.connected && !st?.expired) {
+            setBtnState(btn, 'success', { success: '已连接', idle: 'OAuth 连接' })
+            toast(`连接器「${name}」OAuth 授权成功`, 'success')
+            await loadTools(page)
+            setTimeout(() => setBtnState(btn, 'idle', { idle: 'OAuth 连接' }), 2000)
+            return
+          }
+        }
+        throw new Error('等待授权超时，请在浏览器里完成授权后重试')
+      } catch (err) {
+        if (win && !win.closed) win.close()
+        const msg = err?.message || String(err)
+        setBtnState(btn, 'error', { error: '连接失败', idle: 'OAuth 连接' })
+        // 静态 Bearer key 型服务会在探测阶段直接说明，不要笼统报「失败」
+        toast(/未声明 OAuth|请求头 Token/.test(msg) ? msg : `OAuth 连接失败: ${msg}`, 'error')
+        setTimeout(() => setBtnState(btn, 'idle', { idle: 'OAuth 连接' }), 2500)
+      }
     })
 
     card.querySelector('[data-act="delete"]')?.addEventListener('click', async (e) => {
@@ -639,7 +694,7 @@ function openAddConnectorWizard(page) {
             <option value="none"${state.auth === 'none' ? ' selected' : ''}>无</option>
             <option value="env"${state.auth === 'env' ? ' selected' : ''}>环境变量（稍后在配置中补充）</option>
             <option value="header"${state.auth === 'header' ? ' selected' : ''}>请求头 Token（Bearer / API Key）</option>
-            <option value="oauth"${state.auth === 'oauth' ? ' selected' : ''}>OAuth（令牌注入）</option>
+            <option value="oauth"${state.auth === 'oauth' ? ' selected' : ''} disabled>OAuth 浏览器授权（请用已安装卡片上的「OAuth 连接」）</option>
           </select></div>`
       if (state.auth === 'header') {
         body += `
