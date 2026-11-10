@@ -49,6 +49,32 @@ startup_mark("app.module_imports_done", phase="import")
 _app_singleton: FastAPI | None = None
 
 
+def _warn_multi_worker_without_redis() -> None:
+    """Multi-worker deployments need a shared lock store (Redis).
+
+    The MCP OAuth token-refresh lock (and other cross-process coordination)
+    only spans processes when ``EVOFLOW_REDIS_URL`` is configured; without it,
+    concurrent workers can refresh the same token and hit ``invalid_grant``.
+    Loud, actionable warning — this used to be a hard "keep workers=1" rule.
+    """
+    try:
+        workers = int(os.environ.get("EVOFLOW_GATEWAY_WORKERS") or "1")
+    except ValueError:
+        workers = 1
+    if workers <= 1:
+        return
+    if (os.environ.get("EVOFLOW_REDIS_URL") or "").strip():
+        return
+    logger.warning(
+        "EVOFLOW_GATEWAY_WORKERS=%d but EVOFLOW_REDIS_URL is not set: "
+        "cross-process locks (MCP OAuth token refresh) fall back to "
+        "per-process mode. Concurrent token refreshes may fail with "
+        "invalid_grant. Set EVOFLOW_REDIS_URL=redis://... (and see "
+        "docs/contribute/deploy-cloud.md) for safe multi-worker operation.",
+        workers,
+    )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """Application lifespan: yield early for liveness; heavy init runs in background."""
@@ -73,6 +99,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     init_startup_state(app)
     startup_mark("lifespan.enter", phase="lifespan")
     _st_log("lifespan enter")
+    _warn_multi_worker_without_redis()
     # H3-B-2 fix: ensure EVOFLOW_LANGGRAPH_URL points to THIS Gateway process so
     # chat_session_service thread creation hits the same LangGraph store the
     # frontend stream requests reach via the Vite proxy / Tauri IPC pipe.

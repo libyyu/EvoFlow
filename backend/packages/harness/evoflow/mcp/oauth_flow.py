@@ -556,13 +556,19 @@ async def refresh_all_expiring() -> None:
 
     页面每 4 秒就会轮询一次 config，所以这里必须非阻塞：上一次续期没结束
     就直接返回，避免堆积 task 或把状态接口的响应拖到 15 秒超时。
+
+    锁是跨进程的（Redis SET NX，``EVOFLOW_REDIS_URL`` 配置时启用）：
+    多 worker 部署下两个进程同时续期同一个 token 会触发 ``invalid_grant``。
+    Redis 未配置/不可达时回退进程内锁（单 worker 语义不变）。
     """
-    if _REFRESH_LOCK.locked():
-        return
     records = _load_tokens()
     if not records:
         return
-    async with _REFRESH_LOCK:
+    from evoflow.core.redis_client import cross_process_lock
+
+    async with cross_process_lock("mcp_oauth_refresh", fallback=_REFRESH_LOCK) as _acquired:
+        if not _acquired:
+            return  # 另一个进程/协程正在续期
         for name, record in list(records.items()):
             if not isinstance(record, dict):
                 continue

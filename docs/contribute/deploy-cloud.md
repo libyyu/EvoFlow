@@ -115,33 +115,49 @@ EVOFLOW_FRONTEND_BIND=0.0.0.0 docker compose -p evo-flow -f docker/docker-compos
 | nginx 路由规则 | 改 `docker/nginx/nginx.conf` 后重跑第 3 步命令 |
 | Gateway / LangGraph | 正常 `make up`（见下方注意事项） |
 
-## PostgreSQL 后端（多 worker 云部署，可选）
+## PostgreSQL + Redis（多 worker 云部署，可选）
 
-默认（含桌面一体包）使用 SQLite。多用户云部署可切换 PostgreSQL 后端：
+默认（含桌面一体包）使用 SQLite、单 worker。云上多用户部署可切换为 PostgreSQL + Redis 多 worker：
 
-1. 准备一个 PG 15+ 实例与空库（如 `evoflow`），账号需有建表权限。
-2. 安装可选依赖：`uv sync --extra postgres`（即 `psycopg[binary]>=3.1`）。
-3. 在 `.env` 里设置：
+### 1. 启动数据服务（compose cloud profile）
 
-   ```bash
-   EVOFLOW_DB_URL=postgresql://user:pass@host:5432/evoflow
-   ```
+```bash
+docker compose -p evo-flow -f docker/docker-compose.yaml --profile cloud up -d
+```
 
-重启 Gateway 即生效——启动时自动建全部 schema（124 张表 + 索引 + 外键），业务代码无需任何改动。
+会额外启动 `postgres:16`（容器 `evo-flow-postgres`）与 `redis:7`（容器 `evo-flow-redis`），数据落在 named volumes（`postgres_data` / `redis_data`）。改库密码设 `EVOFLOW_POSTGRES_PASSWORD`。
 
-**机制**：后端是一个与 SQLite 完全同构的连接包装器——`?` 占位符、`INSERT OR IGNORE`、`PRAGMA table_info` / `user_version`（映射为 `evoflow_schema_meta` 版本表）、`AUTOINCREMENT`、`strftime` 默认值等 SQLite 方言全部自动转换；`lastrowid` 用 `lastval()` 等价实现。SQLite 专属的 `INSERT OR REPLACE` 已在代码层重写为双方通用的 `ON CONFLICT ... DO UPDATE`。
+### 2. 安装云组件依赖
 
-**当前限制（Phase 1）**：
+`uv sync --extra cloud`（即 `psycopg[binary]` + `redis`；也可只装 `--extra postgres` / `--extra redis`）。
 
-- 每个进程一条连接、语句串行（与 SQLite 相同的并发模型）；扩展靠多 worker，每 worker 各自持有连接。
-- `EVOFLOW_GATEWAY_WORKERS` 仍须保持 1（MCP OAuth 刷新锁是进程内的，见坑 2）；Redis 锁解除限制属后续计划。
+### 3. 配置并重启 Gateway
+
+`.env`：
+
+```bash
+EVOFLOW_DB_URL=postgresql://evoflow:<密码>@postgres:5432/evoflow
+EVOFLOW_REDIS_URL=redis://redis:6379/0
+EVOFLOW_GATEWAY_WORKERS=2          # 需 Redis；未配 Redis 保持 1
+```
+
+正常 `make up` 重启。PG 模式下启动自动建全部 schema（124 张表 + 索引 + 外键），业务代码零改动；gateway 与 postgres 并行拉起时连接自带重试（`EVOFLOW_PG_CONNECT_RETRIES`，默认 5×2s）。
+
+### 机制
+
+- **数据库**：后端是与 SQLite 完全同构的连接包装器——`?` 占位符、`INSERT OR IGNORE`、`PRAGMA table_info` / `user_version`（映射为 `evoflow_schema_meta` 版本表）、`AUTOINCREMENT`、`strftime` 默认值等 SQLite 方言全部自动转换；`lastrowid` 用 `lastval()` 等价实现。SQLite 专属的 `INSERT OR REPLACE` 已在代码层重写为双方通用的 `ON CONFLICT ... DO UPDATE`。
+- **Redis 锁**：MCP OAuth token 刷新锁升级为跨进程锁（`SET NX` + Lua 比对释放）。Redis 未配置或不可达时自动回退进程内锁——单 worker 语义完全不变；多 worker 但 Redis 挂掉时降级为「尽力刷新」，并在启动/运行时打 warning。Gateway 启动时检测 `EVOFLOW_GATEWAY_WORKERS>1` 且无 Redis 会打大字告警。
+
+### 当前限制（Phase 2）
+
+- 每个进程一条 DB 连接、语句串行（与 SQLite 相同的并发模型）；扩展靠 worker 数，每 worker 各自持有连接。
 - 知识库向量（sqlite-vec）、代码索引、observability / checkpoints 三个辅助库仍为本地 SQLite 文件，不随主库迁移。
 - 连接参数与真实 PG 的端到端验证在 CI（`pg-backend-tests` job，postgres:16 service）覆盖，本地无需装 PG。
 
 ## 注意事项与坑
 
 1. **`make up` 会删掉 frontend 容器**。`scripts/deploy.sh` 带了 `--remove-orphans`，而 frontend 不在默认 profile 里，会被当作孤儿移除。每次 `make up` 之后需重跑第 3 步的 `--profile frontend` 命令。
-2. **Gateway worker 数保持 1**。`EVOFLOW_GATEWAY_WORKERS` 默认 1：MCP OAuth 的 token 刷新锁仍是进程内的，多 worker 会并发续期同一 token 触发 `invalid_grant`。
+2. **Gateway worker 数**：默认 1。多 worker（`EVOFLOW_GATEWAY_WORKERS>1`）必须配 `EVOFLOW_REDIS_URL`（跨进程 OAuth 刷新锁）；未配时 Gateway 启动会打告警，且并发刷新 token 可能触发 `invalid_grant`。
 3. **MCP OAuth 回调地址**：浏览器走 2026 访问时，`EVOFLOW_TRUST_PROXY_HEADERS=1`（compose 已设）+ nginx 的 `X-Forwarded-*` 头会自动拼出正确的 redirect_uri；若用自定义域名/HTTPS 外层代理，另设 `EVOFLOW_PUBLIC_BASE_URL=https://<域名>`。
 4. **未部署前端时**：`/` 返回 404（而非 200 文本页），这是有意设计——防止探活假阳性。API 各路径不受影响。
 5. **公网安全（必读）**：

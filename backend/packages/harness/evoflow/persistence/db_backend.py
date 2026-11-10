@@ -633,7 +633,34 @@ def open_postgres_connection(url: str | None = None, *, ensure_schema: bool = Tr
         ) from exc
 
     timeout = max(1.0, float(os.getenv("EVOFLOW_PG_CONNECT_TIMEOUT_S", "10") or "10"))
-    conn = psycopg.connect(url, autocommit=False, connect_timeout=int(timeout))
+    # Compose brings postgres up in parallel with the gateway; the first
+    # connect attempt may race the container's readiness. Retry a few times
+    # before letting the failure surface (uvicorn would exit and the
+    # container's restart policy would loop anyway — this just converges faster).
+    retries = max(0, int(os.getenv("EVOFLOW_PG_CONNECT_RETRIES", "5") or "5"))
+    delay_s = max(0.2, float(os.getenv("EVOFLOW_PG_CONNECT_RETRY_DELAY_S", "2") or "2"))
+    last_exc: Exception | None = None
+    conn = None
+    import time as _time
+
+    for attempt in range(retries + 1):
+        try:
+            conn = psycopg.connect(url, autocommit=False, connect_timeout=int(timeout))
+            break
+        except Exception as exc:  # noqa: BLE001 - psycopg raises many types
+            last_exc = exc
+            if attempt >= retries:
+                raise
+            logger.warning(
+                "pg: connect failed (attempt %d/%d), retry in %.1fs: %s",
+                attempt + 1,
+                retries + 1,
+                delay_s,
+                exc,
+            )
+            _time.sleep(delay_s)
+    if conn is None:  # pragma: no cover - defensive
+        raise last_exc or RuntimeError(f"pg connect failed: {url}")
     wrapper = PostgresConnection(conn)
     try:
         cur = conn.cursor()
