@@ -2,16 +2,24 @@
 """Pre-flight build validation for EvoFlow desktop builds.
 
 Catches common issues before the expensive PyInstaller + Tauri build (60-90 min CI).
-Runs in < 10 seconds with only stdlib dependencies.
+Runs in < 10 seconds with stdlib only (PyYAML is used opportunistically for the
+server-deploy compose validation; without it that check falls back to text
+assertions).
 
 Usage:
     cd backend && uv run python ../scripts/preflight-build-check.py
 
-Environment variables (all default to "1" = enabled):
-    CHECK_GATEWAY_ENTRY    gateway_entry.py static analysis
-    CHECK_HIDDEN_IMPORTS   .spec hiddenimports reachability
-    CHECK_GITIGNORE        gitignore cross-check
-    CHECK_OFFICIAL_PLUGINS packaging/official-plugins-bundle product plugins
+Environment variables:
+    CHECK_GATEWAY_ENTRY     gateway_entry.py static analysis            [desktop]
+    CHECK_HIDDEN_IMPORTS    .spec hiddenimports reachability            [desktop]
+    CHECK_GITIGNORE         gitignore cross-check                       [desktop]
+    CHECK_OFFICIAL_PLUGINS  packaging/official-plugins-bundle plugins   [desktop]
+    CHECK_SERVER_DEPLOY     docker compose + nginx frontend assets      [server]
+    (the five CHECK_* flags all default to "1" = enabled)
+
+    PREFLIGHT_GROUP         desktop | server | all  (default: all)
+                            filters checks by group; "desktop" keeps the
+                            historical CI behavior minus the server check.
 
 CI: run packaging/fetch-official-plugins-bundle.sh before this script
 (unpacks committed packaging/official-plugins-bundle.tar.gz by default).
@@ -26,11 +34,19 @@ import subprocess
 import sys
 from pathlib import Path
 
+try:
+    import yaml  # type: ignore[import-untyped]
+except ImportError:  # optional: keep the script stdlib-only when PyYAML is absent
+    yaml = None  # type: ignore[assignment]
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 GATEWAY_ENTRY = REPO_ROOT / "backend" / "packaging" / "windows" / "gateway_entry.py"
 GATEWAY_SPEC = REPO_ROOT / "backend" / "packaging" / "windows" / "gateway.spec"
 HARNESS_ROOT = REPO_ROOT / "backend" / "packages" / "harness"
 PACKAGES_ROOT = REPO_ROOT / "backend" / "packages"
+COMPOSE_FILE = REPO_ROOT / "docker" / "docker-compose.yaml"
+NGINX_CONF = REPO_ROOT / "docker" / "nginx" / "nginx.conf"
+EVOPANEL_DIST = REPO_ROOT / "evopanel" / "dist"
 
 RED = "\033[31m"
 GREEN = "\033[32m"
@@ -55,13 +71,22 @@ def _ok(msg: str) -> None:
     print(f"  {GREEN}OK{RESET}  {msg}")
 
 
+_check_seq = 0
+
+
+def _header(title: str) -> None:
+    global _check_seq
+    _check_seq += 1
+    print(f"\n[{GREEN}{_check_seq}{RESET}] {title}")
+
+
 # ---------------------------------------------------------------------------
 # Check 1: gateway_entry.py static AST analysis
 # ---------------------------------------------------------------------------
 
 
 def check_gateway_entry() -> None:
-    print(f"\n[{GREEN}1{RESET}] gateway_entry.py static analysis")
+    _header("gateway_entry.py static analysis")
 
     if not GATEWAY_ENTRY.is_file():
         _e(f"gateway_entry.py not found at {GATEWAY_ENTRY}")
@@ -199,7 +224,7 @@ def check_gateway_entry() -> None:
 
 
 def check_hidden_imports() -> None:
-    print(f"\n[{GREEN}2{RESET}] .spec hiddenimports reachability")
+    _header(".spec hiddenimports reachability")
 
     if not GATEWAY_SPEC.is_file():
         _e(f"gateway.spec not found at {GATEWAY_SPEC}")
@@ -301,7 +326,7 @@ def _resolve_spec_path(expr: str) -> Path | None:
 
 
 def check_gitignore_cross() -> None:
-    print(f"\n[{GREEN}3{RESET}] gitignore cross-check for backend/packages/")
+    _header("gitignore cross-check for backend/packages/")
 
     if not PACKAGES_ROOT.is_dir():
         _e(f"backend/packages/ not found at {PACKAGES_ROOT}")
@@ -385,7 +410,7 @@ def _official_plugin_is_versioned(plugin_dir: Path) -> bool:
 
 
 def check_official_plugins_bundle() -> None:
-    print(f"\n[{GREEN}4{RESET}] official-plugins-bundle product plugins")
+    _header("official-plugins-bundle product plugins")
 
     bundle = REPO_ROOT / "backend" / "packaging" / "official-plugins-bundle"
     if not bundle.is_dir():
@@ -447,20 +472,160 @@ def check_official_plugins_bundle() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Check 5: server deployment assets (docker compose + nginx frontend) [server]
+# ---------------------------------------------------------------------------
+
+
+def check_server_deploy() -> None:
+    _header("server deploy: docker-compose + nginx")
+
+    # ── docker-compose.yaml ─────────────────────────────────────────────────
+    if not COMPOSE_FILE.is_file():
+        _e(f"docker-compose.yaml not found at {COMPOSE_FILE}")
+        compose_text = ""
+    else:
+        compose_text = COMPOSE_FILE.read_text(encoding="utf-8")
+
+    doc = None
+    if compose_text:
+        if yaml is not None:
+            try:
+                doc = yaml.safe_load(compose_text)
+            except yaml.YAMLError as exc:
+                _e(f"docker-compose.yaml is not valid YAML: {exc}")
+                doc = None
+        else:
+            _w("PyYAML not installed — compose validated with text assertions only")
+
+    if isinstance(doc, dict):
+        _check_compose_services(doc)
+    elif compose_text:
+        for needle in (
+            "  frontend:",
+            "profiles:",
+            "nginx.conf:/etc/nginx/nginx.conf",
+            "evopanel/dist:/usr/share/nginx/html",
+        ):
+            if needle not in compose_text:
+                _e(f"docker-compose.yaml missing expected snippet: {needle!r}")
+            else:
+                _ok(f"compose snippet present: {needle.strip()}")
+
+    # ── nginx.conf ──────────────────────────────────────────────────────────
+    if not NGINX_CONF.is_file():
+        _e(f"nginx.conf not found at {NGINX_CONF}")
+        return
+    conf = NGINX_CONF.read_text(encoding="utf-8")
+
+    if conf.count("{") != conf.count("}"):
+        _e(f"nginx.conf braces unbalanced: open={conf.count('{')} close={conf.count('}')}")
+    else:
+        _ok(f"nginx.conf braces balanced ({conf.count('{')} blocks)")
+
+    nginx_expectations = {
+        "listen 2026": "server listens on 2026",
+        "server gateway:8001 resolve;": "gateway upstream with resolve",
+        "server langgraph:2024 resolve;": "langgraph upstream with resolve",
+        "include /etc/nginx/mime.types;": "mime types for static assets",
+        "root /usr/share/nginx/html;": "static frontend root",
+        "location /api/ {": "generic /api/ fallback",
+        "return 404 'EvoFlow API Gateway. Frontend not deployed.'": "no-frontend 404 fallback",
+    }
+    for needle, why in nginx_expectations.items():
+        if needle in conf:
+            _ok(f"nginx: {why}")
+        else:
+            _e(f"nginx.conf missing '{needle}' ({why})")
+
+    if re.search(r"return\s+200", conf):
+        _e(
+            "nginx.conf still contains a 'return 200' catch-all — naive health "
+            "probes would pass while real API calls are swallowed"
+        )
+    else:
+        _ok("nginx: no 'return 200' catch-all")
+
+    if EVOPANEL_DIST.is_dir():
+        _ok(f"evopanel/dist present ({EVOPANEL_DIST.relative_to(REPO_ROOT)})")
+    else:
+        _w(
+            "evopanel/dist not built — the frontend compose profile needs it "
+            "(cd evopanel && pnpm install && pnpm run build)"
+        )
+
+
+def _check_compose_services(doc: dict) -> None:
+    services = doc.get("services") or {}
+    if not isinstance(services, dict):
+        _e("compose 'services:' section missing or not a mapping")
+        return
+    for name in ("gateway", "langgraph", "frontend"):
+        if name not in services:
+            _e(f"compose service missing: {name}")
+        else:
+            _ok(f"compose service present: {name}")
+
+    front = services.get("frontend")
+    if not isinstance(front, dict):
+        return
+
+    profiles = front.get("profiles") or []
+    if "frontend" in profiles:
+        _ok("frontend service is opt-in (profiles: [frontend])")
+    else:
+        _e(
+            "frontend service must be opt-in via profiles: ['frontend'] "
+            "(plain `make up` must not require evopanel/dist on the host)"
+        )
+
+    mounts: list[str] = []
+    for vol in front.get("volumes") or []:
+        if isinstance(vol, str):
+            mounts.append(vol)
+        elif isinstance(vol, dict):
+            mounts.append(f"{vol.get('source', '')}:{vol.get('target', '')}")
+    joined = " ".join(mounts)
+    if "nginx.conf" in joined and "/etc/nginx/nginx.conf" in joined:
+        _ok("frontend mounts docker/nginx/nginx.conf -> /etc/nginx/nginx.conf")
+    else:
+        _e("frontend must mount docker/nginx/nginx.conf at /etc/nginx/nginx.conf")
+    if "evopanel/dist" in joined and "/usr/share/nginx/html" in joined:
+        _ok("frontend mounts evopanel/dist -> /usr/share/nginx/html")
+    else:
+        _e("frontend must mount evopanel/dist at /usr/share/nginx/html")
+
+    ports = " ".join(p for p in (front.get("ports") or []) if isinstance(p, str))
+    if "2026" in ports:
+        _ok("frontend publishes port 2026")
+    else:
+        _e("frontend must publish port 2026")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 
 def main() -> None:
     check_map = {
-        "CHECK_GATEWAY_ENTRY": (check_gateway_entry, True),
-        "CHECK_HIDDEN_IMPORTS": (check_hidden_imports, True),
-        "CHECK_GITIGNORE": (check_gitignore_cross, True),
-        "CHECK_OFFICIAL_PLUGINS": (check_official_plugins_bundle, True),
+        "CHECK_GATEWAY_ENTRY": (check_gateway_entry, True, "desktop"),
+        "CHECK_HIDDEN_IMPORTS": (check_hidden_imports, True, "desktop"),
+        "CHECK_GITIGNORE": (check_gitignore_cross, True, "desktop"),
+        "CHECK_OFFICIAL_PLUGINS": (check_official_plugins_bundle, True, "desktop"),
+        "CHECK_SERVER_DEPLOY": (check_server_deploy, True, "server"),
     }
 
+    group = os.environ.get("PREFLIGHT_GROUP", "all").strip().lower() or "all"
+    if group not in ("desktop", "server", "all"):
+        print(f"Invalid PREFLIGHT_GROUP {group!r} — expected desktop | server | all")
+        sys.exit(2)
+    if group != "all":
+        print(f"Check group: {group}")
+
     total = 0
-    for env_key, (func, default) in check_map.items():
+    for env_key, (func, default, check_group) in check_map.items():
+        if group != "all" and check_group != group:
+            continue
         enabled = os.environ.get(env_key, str(int(default)))
         if enabled.strip() in ("1", "true", "TRUE", "yes"):
             func()
