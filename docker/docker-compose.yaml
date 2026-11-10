@@ -230,7 +230,9 @@ services:
   postgres:
     profiles:
       - cloud
-    image: postgres:16
+    # pgvector image = official postgres:16 + the `vector` extension prebuilt
+    # (required by the knowledge-base vector store in PG mode).
+    image: pgvector/pgvector:pg16
     container_name: evo-flow-postgres
     environment:
       - POSTGRES_USER=evoflow

@@ -1,15 +1,20 @@
 """``sqlite-vec`` backed vector store for the evoflow knowledge base.
 
-Stores chunk embeddings in a ``vec0`` virtual table (``evoflow_kb_vectors``)
-on the shared evoflow SQLite connection and performs cosine-distance
-similarity recall. The companion ordinary tables
-(``evoflow_kb_dataset`` / ``evoflow_kb_source_file`` / ``evoflow_kb_chunk``)
-are created by schema migration v64; the ``vec0`` table is created here
-lazily because its ``embedding FLOAT[N]`` column width is parameterized per
-dataset and cannot be expressed in a single static DDL.
+Default backend (SQLite): stores chunk embeddings in a ``vec0`` virtual table
+(``evoflow_kb_vectors_<dataset_id>``) on the shared evoflow SQLite connection
+and performs cosine-distance similarity recall. When the app runs on
+PostgreSQL (``EVOFLOW_DB_URL`` set), :class:`VectorStore` transparently
+delegates to the pgvector backend
+(:mod:`evoflow.knowledge.vector.pgvector_store`) with the same surface —
+callers never change.
 
-Design notes
-------------
+The companion ordinary tables (``evoflow_kb_dataset`` / ``evoflow_kb_source_file``
+/ ``evoflow_kb_chunk``) are created by schema migration v64; the vector tables
+are created lazily because their ``FLOAT[N]`` / ``vector(N)`` column width is
+parameterized per dataset and cannot be expressed in a single static DDL.
+
+Design notes (SQLite backend)
+-----------------------------
 * **Shared connection**: all access goes through ``evoflow.persistence.db``
   (``get_db`` / ``db_connection_lock`` / ``run_db_transaction``). No private
   connection is ever opened — this keeps WAL/lock semantics consistent with
@@ -17,14 +22,10 @@ Design notes
 * **Embedding format**: ``vec0`` expects embeddings as packed little-endian
   float32 blobs (``struct.pack(f'{n}f', *values)``). Helpers below do the
   (de)serialization.
-* **Dimension parameterization**: the dimension ``N`` is read from the
-  dataset row (``evoflow_kb_dataset.embedding_dim``, default 1536) at
-  :meth:`init` time and used both to build the virtual table DDL and to
-  validate every inserted vector.
 * **Metric**: ``vec0`` ``MATCH`` queries return cosine *distance*
   (``distance = 1 - cosine_similarity`` in ``[0, 2]``); ``recall`` returns
   ``(chunk_id, distance, score)`` where ``score = 1 - distance`` is the
-  similarity in ``[-1, 1]``.
+  similarity in ``[-1, 1]`` — identical to pgvector's ``<=>``.
 """
 
 from __future__ import annotations
@@ -33,41 +34,20 @@ import logging
 import sqlite3
 import struct
 from collections.abc import Iterable, Sequence
-from dataclasses import dataclass
 from typing import Any
 
+from evoflow.knowledge.vector.base import (  # noqa: F401 - re-exported API
+    DEFAULT_EMBEDDING_DIM,
+    RecallHit,
+    VectorStoreError,
+    vectors_table_for,
+)
 from evoflow.persistence.db import db_connection_lock, get_db
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_EMBEDDING_DIM = 1536
-_VECTORS_TABLE_PREFIX = "evoflow_kb_vectors_"
-
-
-class VectorStoreError(RuntimeError):
-    """Raised on vector-store misuse (extension missing, bad dims, ...)."""
-
-
-def _vectors_table_for(dataset_id: str) -> str:
-    """Return the per-dataset ``vec0`` virtual table name.
-
-    Each dataset gets its own ``evoflow_kb_vectors_<dataset_id>`` table so
-    that datasets with different embedding dimensions can coexist in the same
-    database (the ``vec0`` ``FLOAT[N]`` width is fixed per table).
-    """
-    return f"{_VECTORS_TABLE_PREFIX}{dataset_id}"
-
-
-@dataclass(frozen=True)
-class RecallHit:
-    """A single recall result row."""
-
-    chunk_id: str
-    distance: float
-    score: float
-
-    def as_dict(self) -> dict[str, Any]:
-        return {"chunk_id": self.chunk_id, "distance": self.distance, "score": self.score}
+# Backwards-compatible alias for the per-dataset table-name helper.
+_vectors_table_for = vectors_table_for
 
 
 def _pack_vector(values: Sequence[float]) -> bytes:
@@ -80,12 +60,12 @@ def _unpack_vector(blob: bytes, dim: int) -> list[float]:
     return list(struct.unpack(f"{dim}f", blob))
 
 
-class VectorStore:
+class _SqliteVecStore:
     """Cosine-similarity vector store over ``sqlite-vec`` ``vec0``.
 
-    A single ``VectorStore`` instance is bound to one dataset (and thus one
-    embedding dimension). Use :meth:`init` (idempotent) to ensure the
-    dataset row + virtual table exist before inserting/recalling.
+    A single instance is bound to one dataset (and thus one embedding
+    dimension). Use :meth:`init` (idempotent) to ensure the dataset row +
+    virtual table exist before inserting/recalling.
     """
 
     def __init__(self, dataset_id: str, dim: int | None = None) -> None:
@@ -147,7 +127,7 @@ class VectorStore:
         ``IF NOT EXISTS``. The dimension is interpolated into the DDL — this is
         the only place where the parameterized dimension materializes.
         """
-        table = _vectors_table_for(self.dataset_id)
+        table = vectors_table_for(self.dataset_id)
         ddl = f"CREATE VIRTUAL TABLE IF NOT EXISTS {table} USING vec0(chunk_id TEXT PRIMARY KEY, embedding FLOAT[{dim}])"
         try:
             conn.execute(ddl)
@@ -172,7 +152,7 @@ class VectorStore:
         if len(embedding) != dim:
             raise VectorStoreError(f"embedding dimension mismatch: expected {dim}, got {len(embedding)}")
         blob = _pack_vector(embedding)
-        table = _vectors_table_for(self.dataset_id)
+        table = vectors_table_for(self.dataset_id)
         with db_connection_lock():
             conn = get_db()
             conn.execute(
@@ -194,7 +174,7 @@ class VectorStore:
         with db_connection_lock():
             conn = get_db()
             conn.executemany(
-                f"INSERT OR REPLACE INTO {_vectors_table_for(self.dataset_id)} (chunk_id, embedding) VALUES (?, ?)",
+                f"INSERT OR REPLACE INTO {vectors_table_for(self.dataset_id)} (chunk_id, embedding) VALUES (?, ?)",
                 rows,
             )
             conn.commit()
@@ -205,7 +185,7 @@ class VectorStore:
         """Delete a single chunk's embedding (no-op if absent)."""
         with db_connection_lock():
             conn = get_db()
-            conn.execute(f"DELETE FROM {_vectors_table_for(self.dataset_id)} WHERE chunk_id = ?", (chunk_id,))
+            conn.execute(f"DELETE FROM {vectors_table_for(self.dataset_id)} WHERE chunk_id = ?", (chunk_id,))
             conn.commit()
 
     def delete_many(self, chunk_ids: Iterable[str]) -> int:
@@ -216,7 +196,7 @@ class VectorStore:
         with db_connection_lock():
             conn = get_db()
             cur = conn.executemany(
-                f"DELETE FROM {_vectors_table_for(self.dataset_id)} WHERE chunk_id = ?",
+                f"DELETE FROM {vectors_table_for(self.dataset_id)} WHERE chunk_id = ?",
                 [(cid,) for cid in ids],
             )
             conn.commit()
@@ -258,7 +238,7 @@ class VectorStore:
             raise VectorStoreError(f"query embedding dimension mismatch: expected {dim}, got {len(query_embedding)}")
         k = max(1, int(top_k))
         blob = _pack_vector(query_embedding)
-        table = _vectors_table_for(self.dataset_id)
+        table = vectors_table_for(self.dataset_id)
         with db_connection_lock():
             conn = get_db()
             rows = conn.execute(
@@ -277,7 +257,7 @@ class VectorStore:
         """
         with db_connection_lock():
             conn = get_db()
-            row = conn.execute(f"SELECT COUNT(*) AS c FROM {_vectors_table_for(self.dataset_id)}").fetchone()
+            row = conn.execute(f"SELECT COUNT(*) AS c FROM {vectors_table_for(self.dataset_id)}").fetchone()
         return int(row["c"]) if row is not None else 0
 
     def get_dataset_count(self) -> int:
@@ -289,3 +269,58 @@ class VectorStore:
                 (self.dataset_id,),
             ).fetchone()
         return int(row["c"]) if row is not None else 0
+
+
+class VectorStore:
+    """Vector store facade: sqlite-vec (default) or pgvector (PostgreSQL mode).
+
+    Same surface on both backends — instantiate per dataset, call
+    :meth:`init`, then insert / recall / delete. The backend is fixed per
+    process by ``EVOFLOW_DB_URL`` (see
+    :mod:`evoflow.persistence.db_backend`).
+    """
+
+    def __init__(self, dataset_id: str, dim: int | None = None) -> None:
+        from evoflow.persistence.db_backend import postgres_mode
+
+        if postgres_mode():
+            from evoflow.knowledge.vector.pgvector_store import PgVectorStore
+
+            self._impl: Any = PgVectorStore(dataset_id, dim)
+        else:
+            self._impl = _SqliteVecStore(dataset_id, dim)
+
+    @property
+    def dataset_id(self) -> str:
+        return self._impl.dataset_id
+
+    @property
+    def dim(self) -> int:
+        return self._impl.dim
+
+    def init(self, *, name: str | None = None, embedding_model: str = "") -> int:
+        return self._impl.init(name=name, embedding_model=embedding_model)
+
+    def insert(self, chunk_id: str, embedding: Sequence[float]) -> None:
+        self._impl.insert(chunk_id, embedding)
+
+    def insert_many(self, items: Iterable[tuple[str, Sequence[float]]]) -> int:
+        return self._impl.insert_many(items)
+
+    def delete(self, chunk_id: str) -> None:
+        self._impl.delete(chunk_id)
+
+    def delete_many(self, chunk_ids: Iterable[str]) -> int:
+        return self._impl.delete_many(chunk_ids)
+
+    def delete_by_dataset(self) -> int:
+        return self._impl.delete_by_dataset()
+
+    def recall(self, query_embedding: Sequence[float], *, top_k: int = 5) -> list[RecallHit]:
+        return self._impl.recall(query_embedding, top_k=top_k)
+
+    def get_count(self) -> int:
+        return self._impl.get_count()
+
+    def get_dataset_count(self) -> int:
+        return self._impl.get_dataset_count()

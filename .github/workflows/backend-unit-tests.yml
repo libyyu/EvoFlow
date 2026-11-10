@@ -50,7 +50,9 @@ jobs:
 
     services:
       postgres:
-        image: postgres:16
+        # pgvariant image: official postgres:16 + pgvector extension prebuilt
+        # (needed by the knowledge-base vector store live test).
+        image: pgvector/pgvector:pg16
         env:
           POSTGRES_USER: evoflow
           POSTGRES_PASSWORD: evoflow_ci

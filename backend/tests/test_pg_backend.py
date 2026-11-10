@@ -484,3 +484,22 @@ class TestLivePG:
         db.commit()
         row = db.execute("SELECT flag FROM evoflow_ci_bool_probe WHERE k = 'b'").fetchone()
         assert row["flag"] == 1
+
+    def test_pgvector_roundtrip(self, live_pg):
+        """Knowledge-base vector store end-to-end on a real pgvector server."""
+        from evoflow.knowledge.vector import VectorStore
+
+        vs = VectorStore("ci_pg_ds", dim=4)
+        assert vs.init(name="CI PG", embedding_model="ci") == 4
+        vs.insert("c1", [1.0, 0.0, 0.0, 0.0])
+        assert vs.insert_many([("c2", [0.0, 1.0, 0.0, 0.0]), ("c3", [0.0, 0.0, 1.0, 0.0])]) == 2
+        assert vs.get_count() == 3
+
+        hits = vs.recall([1.0, 0.0, 0.0, 0.0], top_k=2)
+        assert len(hits) == 2
+        assert hits[0].chunk_id == "c1"
+        assert hits[0].distance < 0.001  # exact direction match
+        assert hits[0].score > 0.999
+
+        assert vs.delete_many(["c2", "c3"]) == 2
+        assert vs.get_count() == 1

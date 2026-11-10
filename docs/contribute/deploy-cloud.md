@@ -145,14 +145,14 @@ EVOFLOW_GATEWAY_WORKERS=2          # 需 Redis；未配 Redis 保持 1
 
 ### 机制
 
-- **数据库**：后端是与 SQLite 完全同构的连接包装器——`?` 占位符、`INSERT OR IGNORE`、`PRAGMA table_info` / `user_version`（映射为 `evoflow_schema_meta` 版本表）、`AUTOINCREMENT`、`strftime` 默认值等 SQLite 方言全部自动转换；`lastrowid` 用 `lastval()` 等价实现。SQLite 专属的 `INSERT OR REPLACE` 已在代码层重写为双方通用的 `ON CONFLICT ... DO UPDATE`。
+- **数据库**：后端是与 SQLite 完全同构的连接包装器——`?` 占位符、`INSERT OR IGNORE`、`PRAGMA table_info` / `user_version`（映射为 `evoflow_schema_meta` 版本表）、`AUTOINCREMENT`、`strftime` 默认值等 SQLite 方言全部自动转换；`lastrowid` 用 `lastval()` 等价实现。SQLite 专属的 `INSERT OR REPLACE` 已在代码层重写为双方通用的 `ON CONFLICT ... DO UPDATE`。知识库向量存储自动切 pgvector（compose 镜像已带 `vector` 扩展；余弦距离语义与 sqlite-vec 一致）。
 - **Redis 锁**：MCP OAuth token 刷新锁升级为跨进程锁（`SET NX` + Lua 比对释放）。Redis 未配置或不可达时自动回退进程内锁——单 worker 语义完全不变；多 worker 但 Redis 挂掉时降级为「尽力刷新」，并在启动/运行时打 warning。Gateway 启动时检测 `EVOFLOW_GATEWAY_WORKERS>1` 且无 Redis 会打大字告警。
 
-### 当前限制（Phase 2）
+### 当前限制（Phase 3）
 
 - 每个进程一条 DB 连接、语句串行（与 SQLite 相同的并发模型）；扩展靠 worker 数，每 worker 各自持有连接。
-- 知识库向量（sqlite-vec）、代码索引、observability / checkpoints 三个辅助库仍为本地 SQLite 文件，不随主库迁移。
-- 连接参数与真实 PG 的端到端验证在 CI（`pg-backend-tests` job，postgres:16 service）覆盖，本地无需装 PG。
+- 代码索引（code_index）与 owned 知识库、observability / checkpoints 辅助库仍为本地 SQLite 文件，不随主库迁移（均为本地功能，云端各 worker 独立）。
+- 连接参数与真实 PG 的端到端验证在 CI（`pg-backend-tests` job，pgvector/pgvector:pg16 service）覆盖，本地无需装 PG。
 
 ## 注意事项与坑
 
