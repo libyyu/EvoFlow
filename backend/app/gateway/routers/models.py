@@ -301,6 +301,14 @@ async def set_primary_model(http_request: Request, request: SetPrimaryModelReque
         model = config.get_model_config(model_name)
         if model is None:
             raise HTTPException(status_code=404, detail=f"Model '{model_name}' not found")
+        # The primary model is a GLOBAL default for every user's new sessions.
+        # A private model is only resolvable for its owner, so pinning it here
+        # would silently shift everyone else's default to models[0].
+        if str(getattr(model, "owner_principal_id", None) or "").strip():
+            raise HTTPException(
+                status_code=422,
+                detail="主模型是所有用户新会话的默认值，只能设共享模型；私有模型请在会话中单独选择",
+            )
 
         config.primary_model = model_name
         cfg_repo.set_app_setting("primary_model", model_name)
