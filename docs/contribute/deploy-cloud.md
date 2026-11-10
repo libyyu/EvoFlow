@@ -121,7 +121,11 @@ EVOFLOW_FRONTEND_BIND=0.0.0.0 docker compose -p evo-flow -f docker/docker-compos
 2. **Gateway worker 数保持 1**。`EVOFLOW_GATEWAY_WORKERS` 默认 1：MCP OAuth 的 token 刷新锁仍是进程内的，多 worker 会并发续期同一 token 触发 `invalid_grant`。
 3. **MCP OAuth 回调地址**：浏览器走 2026 访问时，`EVOFLOW_TRUST_PROXY_HEADERS=1`（compose 已设）+ nginx 的 `X-Forwarded-*` 头会自动拼出正确的 redirect_uri；若用自定义域名/HTTPS 外层代理，另设 `EVOFLOW_PUBLIC_BASE_URL=https://<域名>`。
 4. **未部署前端时**：`/` 返回 404（而非 200 文本页），这是有意设计——防止探活假阳性。API 各路径不受影响。
-5. **公网安全**：直接 `0.0.0.0` 暴露 2026 前请确认网关鉴权（JWT/CORS）配置符合你的安全要求，建议置于宿主 nginx（加 TLS）或云 LB 之后。
+5. **公网安全（必读）**：
+   - **WebUI 远程访问鉴权默认关闭**——不开的话所有远程 API 请求无鉴权直接放行。部署完第一件事：在设置页开启 WebUI 远程访问、修改默认 `admin` 密码、为成员创建各自账号（支持用户名密码 / OIDC / 二维码登录）。
+   - 开启后：远程请求必须带 JWT（浏览器登录或客户端登录），本机请求不受影响；会话与工作空间按登录用户隔离。
+   - **模型配置（含 API key）是全局共享的**：任何用户在设置页配的模型，所有登录用户都能使用。团队内部可视为共享模型池；若需要「各人各的 key/额度」隔离，当前版本不支持。
+   - 建议 2026 仍置于宿主 nginx（加 TLS）或云 LB 之后。
 
 ## 故障排查
 
