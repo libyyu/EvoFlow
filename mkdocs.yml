@@ -74,6 +74,7 @@ nav:
       - 贡献者指南: contribute/index.md
       - 仓库地图: contribute/repo-map.md
       - 分支与检查: contribute/branching-and-checks.md
+      - 云服部署（Gateway 后端 + Web 前端入口）: contribute/deploy-cloud.md
       - 添加 Skill: contribute/add-skill.md
       - 添加 IM 渠道: contribute/add-channel.md
       - RFC: contribute/rfc.md
