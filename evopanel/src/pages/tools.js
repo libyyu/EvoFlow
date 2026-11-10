@@ -32,6 +32,47 @@ function unwrapMcpServers(parsed) {
 let _loadSeq = 0
 let _statusPollTimer = null
 
+// 网关只在配置变更时重新加载 MCP 工具。启动瞬间的网络/TLS 抖动会让连接器
+// 一直卡在 error，直到用户手动改一次配置；这里对可重试错误做限次自动重载。
+const MCP_RETRYABLE_ERROR = /ssl|tls|wrong.version|timeout|timed out|connection|session terminated|reset by peer|eof|50[234]|temporarily/i
+const _mcpRetryState = new Map()
+let _mcpReloadInFlight = false
+
+async function maybeRetryFailedServers(page, data) {
+  const statuses = data?.server_status || {}
+  const servers = data?.mcp_servers || {}
+  const now = Date.now()
+  const due = []
+  for (const [name, st] of Object.entries(statuses)) {
+    const retryable = st?.load_status === 'error'
+      && servers[name]?.enabled !== false
+      && MCP_RETRYABLE_ERROR.test(String(st?.error || ''))
+    if (!retryable) {
+      _mcpRetryState.delete(name)
+      continue
+    }
+    const prev = _mcpRetryState.get(name) || { count: 0, lastAt: 0 }
+    // 首次立即重载，之后每 15 秒一次、最多 3 次，避免永久错误反复刷接口。
+    if (prev.count >= 3 || (prev.count > 0 && now - prev.lastAt < 15000)) continue
+    due.push(name)
+  }
+  if (!due.length || _mcpReloadInFlight) return
+  _mcpReloadInFlight = true
+  try {
+    for (const name of due) {
+      const prev = _mcpRetryState.get(name) || { count: 0, lastAt: 0 }
+      _mcpRetryState.set(name, { count: prev.count + 1, lastAt: now })
+    }
+    // 用原配置触发网关 reset_mcp_tools_cache；不改任何用户设置。
+    await api.updateMCPConfig(servers)
+    setTimeout(() => { void loadTools(page, { silent: true }) }, 2500)
+  } catch {
+    // 重载失败交给下一轮轮询，不要打断页面
+  } finally {
+    _mcpReloadInFlight = false
+  }
+}
+
 const STATUS_UI = {
   ready: { key: 'ready', label: '可用' },
   disabled: { key: 'disabled', label: '已停用' },
@@ -261,8 +302,15 @@ async function loadTools(page, opts = {}) {
     const servers = data?.mcp_servers || {}
     const hasPending = Object.values(data?.server_status || {}).some((s) => s?.load_status === 'pending')
       || (!data?.cache_initialized && Object.values(servers).some((c) => c.enabled !== false))
-    if (hasPending) scheduleStatusPoll(page)
+    const hasRetryableError = Object.entries(data?.server_status || {}).some(([name, s]) => {
+      if (s?.load_status !== 'error' || !MCP_RETRYABLE_ERROR.test(String(s?.error || ''))) return false
+      const tried = _mcpRetryState.get(name)
+      return !tried || tried.count < 3
+    })
+    // 有可重试错误时也要继续轮询，否则 error 状态会永远停在这一刻。
+    if (hasPending || hasRetryableError) scheduleStatusPoll(page)
     else stopStatusPoll()
+    void maybeRetryFailedServers(page, data)
   } catch (e) {
     if (seq !== _loadSeq) return
     stopStatusPoll()
@@ -487,8 +535,11 @@ function bindInstalledEvents(page, contentEl, data) {
           }
           if (st?.connected && !st?.expired) {
             setBtnState(btn, 'success', { success: '已连接', idle: 'OAuth 连接' })
-            toast(`连接器「${name}」OAuth 授权成功`, 'success')
+            toast(`连接器「${name}」OAuth 授权成功，正在重新加载工具`, 'success')
             await loadTools(page)
+            // 回调里已 reset 缓存，但工具加载是异步的：再刷一次让卡片状态跟上，
+            // 避免「授权成功」和「连接失败」同时出现在页面上。
+            setTimeout(() => { void loadTools(page, { silent: true }) }, 2500)
             setTimeout(() => setBtnState(btn, 'idle', { idle: 'OAuth 连接' }), 2000)
             return
           }
