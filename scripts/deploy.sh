@@ -50,11 +50,12 @@ if [ ! -f "$EVOFLOW_CONFIG_PATH" ]; then
         cp "$REPO_ROOT/config.example.yaml" "$EVOFLOW_CONFIG_PATH"
         echo -e "${GREEN}✓ Seeded config.example.yaml → $EVOFLOW_CONFIG_PATH${NC}"
         echo -e "${YELLOW}⚠ config.yaml was seeded from the example template.${NC}"
-        echo "  Edit $EVOFLOW_CONFIG_PATH and set your model API keys before use."
+        echo "  Model API keys are NOT configured here: add models in EvoPanel"
+        echo "  Settings after first launch (stored in server-side SQLite)."
     else
         echo -e "${RED}✗ No config.yaml found.${NC}"
-        echo "  Run 'make config' from the repo root to generate one,"
-        echo "  then set the required model API keys."
+        echo "  Run 'make config' from the repo root to generate one"
+        echo "  (model API keys are configured later in EvoPanel Settings)."
         exit 1
     fi
 else

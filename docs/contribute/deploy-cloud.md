@@ -44,9 +44,11 @@
 
 ```bash
 cd <repo>
-make config        # 首次：生成 config.yaml，填模型 API key
+make config        # 首次：生成 config.yaml（默认模板即可，一般无需编辑）
 make up            # 构建镜像并启动 gateway + langgraph
 ```
+
+> **模型 API key 不在 config.yaml 里配**：config.yaml 的 `models:` 段已废弃，启动时直接忽略。模型（含 API key）在**设置页**配置，持久化在服务端 SQLite（`EVOFLOW_HOME` 下的 `evoflow.db`）。云服是全新实例，部署后需在设置页里对云服配一次模型。
 
 完成后 `gateway` 监听 `127.0.0.1:8001`、`langgraph` 监听 `127.0.0.1:2024`（均仅本机）。此阶段桌面端已可通过 SSH 隧道或自定义反代使用；IM 渠道等由 Gateway 自身承载，不依赖 frontend 容器。
 
