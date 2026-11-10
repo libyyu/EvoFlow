@@ -273,6 +273,20 @@ async function loadTools(page, opts = {}) {
   }
 }
 
+/** 清空搜索与状态筛选；同步刷新增强后的下拉 trigger 文本。 */
+function resetConnectorFilters(page) {
+  page._mcpState.filter = ''
+  page._mcpState.status = ''
+  const search = page.querySelector('#mcp-filter-input')
+  if (search) search.value = ''
+  const statusSel = page.querySelector('#mcp-filter-status')
+  if (statusSel) {
+    statusSel.value = ''
+    // ef-dropdown-select 监听原生 select 的 change 来同步自定义 trigger 文案
+    statusSel.dispatchEvent(new Event('change', { bubbles: true }))
+  }
+}
+
 function renderInstalled(page, data) {
   const contentEl = page.querySelector('#tools-content')
   const banners = page.querySelector('#mcp-banners')
@@ -320,7 +334,15 @@ function renderInstalled(page, data) {
 
   if (countEl) countEl.textContent = `共 ${list.length} 个连接器`
   if (!list.length) {
-    contentEl.innerHTML = `<div class="ec-empty">暂无连接器，点击右上角「添加连接器」开始</div>`
+    const total = Object.keys(servers).length
+    // 配置里明明有连接器，但被搜索/状态筛选挡住时，别让用户以为「没添加成功」。
+    contentEl.innerHTML = total
+      ? `<div class="ec-empty">当前筛选条件下没有连接器（共 ${total} 个）<button type="button" class="btn btn-secondary btn-sm" data-act="clear-mcp-filter" style="margin-left:8px">清空筛选</button></div>`
+      : `<div class="ec-empty">暂无连接器，点击右上角「添加连接器」开始</div>`
+    contentEl.querySelector('[data-act="clear-mcp-filter"]')?.addEventListener('click', () => {
+      resetConnectorFilters(page)
+      renderInstalled(page, page._mcpState.data)
+    })
     return
   }
 
@@ -568,12 +590,24 @@ function openAddConnectorWizard(page) {
     url: '',
     description: '',
     auth: 'none',
+    headerName: 'Authorization',
+    headerValue: '',
+    oauthTokenUrl: '',
+    oauthGrant: 'client_credentials',
+    oauthClientId: '',
+    oauthClientSecret: '',
+    oauthRefreshToken: '',
+    oauthScope: '',
     scope: 'global',
   }
   const steps = ['基本信息', '连接配置', '身份认证', '测试连接', '使用范围', '完成']
+  // 认证方式变化时要重绘本步以显示/隐藏对应字段；用「上次渲染时的值」判断，
+  // 因为 ef-dropdown-select 会先派发 input 再派发 change，change 里读不到旧值。
+  let renderedAuth = null
 
   const renderStep = () => {
     const step = state.step
+    renderedAuth = state.auth
     let body = `<div class="ec-wizard-steps">${steps
       .map((s, i) => `<span class="ec-wizard-step${i === step ? ' is-on' : ''}${i < step ? ' is-done' : ''}">${i + 1}. ${s}</span>`)
       .join('')}</div>`
@@ -602,11 +636,39 @@ function openAddConnectorWizard(page) {
       body += `
         <div class="form-group"><label class="form-label">认证方式</label>
           <select class="form-input" data-f="auth">
-            <option value="none">无</option>
-            <option value="env">环境变量（稍后在配置中补充）</option>
-            <option value="oauth">OAuth</option>
-          </select></div>
-        <p class="form-hint">敏感凭证建议写入本机环境或配置文件，勿硬编码到对话中。</p>`
+            <option value="none"${state.auth === 'none' ? ' selected' : ''}>无</option>
+            <option value="env"${state.auth === 'env' ? ' selected' : ''}>环境变量（稍后在配置中补充）</option>
+            <option value="header"${state.auth === 'header' ? ' selected' : ''}>请求头 Token（Bearer / API Key）</option>
+            <option value="oauth"${state.auth === 'oauth' ? ' selected' : ''}>OAuth（令牌注入）</option>
+          </select></div>`
+      if (state.auth === 'header') {
+        body += `
+          <div class="form-group"><label class="form-label">请求头名称</label>
+            <input class="form-input" data-f="headerName" value="${esc(state.headerName)}" placeholder="Authorization"></div>
+          <div class="form-group"><label class="form-label">请求头值</label>
+            <input class="form-input" data-f="headerValue" value="${esc(state.headerValue)}" placeholder="Bearer eyJ..."></div>
+          <p class="form-hint">适用于返回 401 的远程 MCP：填入服务方提供的 Bearer Token 或 API Key。</p>`
+      } else if (state.auth === 'oauth') {
+        body += `
+          <p class="form-hint">EvoFlow 的 OAuth 是「令牌注入」：网关用 client_credentials / refresh_token 向令牌地址换取 Access Token 并注入请求头，<b>不会弹出浏览器授权链接</b>。若目标服务要求浏览器交互式授权，请在外部取得 Token 后改用「请求头 Token」。</p>
+          <div class="form-group"><label class="form-label">令牌地址 Token URL</label>
+            <input class="form-input" data-f="oauthTokenUrl" value="${esc(state.oauthTokenUrl)}" placeholder="https://.../oauth/token"></div>
+          <div class="form-group"><label class="form-label">授权模式</label>
+            <select class="form-input" data-f="oauthGrant">
+              <option value="client_credentials"${state.oauthGrant === 'client_credentials' ? ' selected' : ''}>client_credentials</option>
+              <option value="refresh_token"${state.oauthGrant === 'refresh_token' ? ' selected' : ''}>refresh_token</option>
+            </select></div>
+          <div class="form-group"><label class="form-label">Client ID</label>
+            <input class="form-input" data-f="oauthClientId" value="${esc(state.oauthClientId)}" placeholder="client_credentials 必填"></div>
+          <div class="form-group"><label class="form-label">Client Secret</label>
+            <input class="form-input" data-f="oauthClientSecret" value="${esc(state.oauthClientSecret)}" placeholder="client_credentials 必填"></div>
+          <div class="form-group"><label class="form-label">Refresh Token</label>
+            <input class="form-input" data-f="oauthRefreshToken" value="${esc(state.oauthRefreshToken)}" placeholder="refresh_token 模式必填"></div>
+          <div class="form-group"><label class="form-label">Scope（可选）</label>
+            <input class="form-input" data-f="oauthScope" value="${esc(state.oauthScope)}" placeholder="例如 mcp:read"></div>`
+      } else {
+        body += `<p class="form-hint">敏感凭证建议写入本机环境或配置文件，勿硬编码到对话中。</p>`
+      }
     } else if (step === 3) {
       body += `<p>将写入连接器配置并触发后台连接。保存后可在列表中查看「连接中 / 可用 / 失败」状态。</p>`
     } else if (step === 4) {
@@ -636,11 +698,12 @@ function openAddConnectorWizard(page) {
 
     const root = page.querySelector('#ecDrawer')
     root.querySelectorAll('[data-f]').forEach((el) => {
+      const sync = () => { state[el.dataset.f] = el.value }
+      el.addEventListener('input', sync)
       el.addEventListener('change', () => {
-        state[el.dataset.f] = el.value
-      })
-      el.addEventListener('input', () => {
-        state[el.dataset.f] = el.value
+        sync()
+        // 认证方式换了，要立刻显示/隐藏对应的凭证输入项
+        if (el.dataset.f === 'auth' && state.auth !== renderedAuth) renderStep()
       })
     })
     root.querySelector('[data-act="prev"]')?.addEventListener('click', () => {
@@ -661,8 +724,14 @@ function openAddConnectorWizard(page) {
           state.step = 4
           renderStep()
         } catch (err) {
-          setBtnState(btn, 'error', { error: '失败，重试', idle: '保存并测试' })
-          toast('添加失败: ' + (err?.message || err), 'error')
+          const msg = err?.message || String(err)
+          if (msg.startsWith('CANCELLED:')) {
+            setBtnState(btn, 'idle', { idle: '保存并测试' })
+            toast(msg.slice('CANCELLED:'.length), 'info')
+          } else {
+            setBtnState(btn, 'error', { error: '失败，重试', idle: '保存并测试' })
+            toast('添加失败: ' + msg, 'error')
+          }
         }
         return
       }
@@ -700,13 +769,52 @@ async function saveWizardConnector(page, state) {
       .filter(Boolean)
   } else {
     cfg.url = state.url || ''
+    if (!String(cfg.url).trim()) throw new Error('远程连接器需要填写 URL')
   }
-  if (state.auth === 'oauth') cfg.oauth = {}
+  if (state.auth === 'header') {
+    const headerName = String(state.headerName || 'Authorization').trim() || 'Authorization'
+    const headerValue = String(state.headerValue || '').trim()
+    if (!headerValue) throw new Error('请填写请求头值（例如 Bearer xxxx）')
+    cfg.headers = { [headerName]: headerValue }
+  } else if (state.auth === 'oauth') {
+    // 后端 evoflow.mcp.oauth 只支持 client_credentials / refresh_token 令牌注入，
+    // 没有授权码（浏览器跳转）流程。空 oauth:{} 只会让网关拿空 token_url 去换 token，必然 401。
+    const tokenUrl = String(state.oauthTokenUrl || '').trim()
+    if (!tokenUrl) throw new Error('OAuth 需要填写令牌地址 Token URL')
+    const grant = state.oauthGrant === 'refresh_token' ? 'refresh_token' : 'client_credentials'
+    const clientId = String(state.oauthClientId || '').trim()
+    const clientSecret = String(state.oauthClientSecret || '').trim()
+    const refreshToken = String(state.oauthRefreshToken || '').trim()
+    if (grant === 'client_credentials' && (!clientId || !clientSecret)) {
+      throw new Error('client_credentials 需要 Client ID 和 Client Secret')
+    }
+    if (grant === 'refresh_token' && !refreshToken) {
+      throw new Error('refresh_token 模式需要 Refresh Token')
+    }
+    cfg.oauth = {
+      enabled: true,
+      token_url: tokenUrl,
+      grant_type: grant,
+      client_id: clientId || null,
+      client_secret: clientSecret || null,
+      refresh_token: refreshToken || null,
+      scope: String(state.oauthScope || '').trim() || null,
+    }
+  }
   const current = await api.getMCPConfig()
   const servers = { ...(current?.mcp_servers || {}) }
-  if (servers[name]) throw new Error('同名连接器已存在')
+  if (servers[name]) {
+    const overwrite = await showConfirm(
+      `连接器「${name}」已存在。是否用当前向导的配置覆盖它？\n（覆盖会替换原有的认证/连接参数；取消后可在「已安装」列表中点「配置」编辑）`,
+    )
+    if (!overwrite) {
+      throw new Error('CANCELLED:同名连接器已存在，可清空筛选后在列表中编辑或删除')
+    }
+  }
   servers[name] = cfg
   await api.updateMCPConfig(servers)
+  // 新增项可能落在某个状态筛选之外，保存后强制清空筛选，避免「配置里有、列表看不到」。
+  resetConnectorFilters(page)
   toast(`连接器「${name}」已添加`, 'success')
   await loadTools(page)
   const tools = page._mcpState.data?.server_status?.[name]?.tool_count
