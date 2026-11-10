@@ -1849,6 +1849,23 @@ export const api = {
   /** Restart Agent Runtime only (split process model); Control Plane stays up. */
   reloadLanggraphRuntime: () => invoke('reload_langgraph_runtime'),
   softReloadGateway: () => _softReloadGatewayCaches(),
+  // P0: 云服 Gateway 端点。优先级：EVOFLOW_GATEWAY_URL > 持久化配置 > 本地 sidecar
+  getGatewayEndpoint: () => invoke('get_gateway_endpoint'),
+  setGatewayEndpoint: (baseUrl) => invoke('set_gateway_endpoint', { baseUrl }),
+  clearGatewayEndpoint: () => invoke('clear_gateway_endpoint'),
+  /** 只探 /health/liveness；不写入 runtime override，避免「测试」误切换当前会话。 */
+  probeGatewayEndpoint: async (baseUrl, timeoutMs = 4000) => {
+    const result = await invoke('gateway_health_probe', {
+      kind: 'liveness',
+      timeoutMs: Math.max(500, Number(timeoutMs) || 4000),
+      baseUrl: String(baseUrl || '').trim().replace(/\/+$/, ''),
+    })
+    return {
+      ok: !!(result && result.ok),
+      status: Number(result?.status || 0),
+      baseUrl: String(result?.baseUrl || ''),
+    }
+  },
   // 测试模型连接（轻量 /models/test，不走 /models/invoke，不强制应用配置）
   testModel: async (baseUrl, apiKey, modelId, apiType = null, configName = null) => {
     const body = {

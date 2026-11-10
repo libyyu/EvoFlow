@@ -309,7 +309,7 @@ pub fn take_sidecar_app_server_stdio() -> Option<(ChildStdin, ChildStdout)> {
 
 /// Whether this process owns a Gateway child we spawned (vs external EVOFLOW_GATEWAY_URL).
 pub fn owns_backend_sidecar() -> bool {
-    env_gateway_base_url().is_none()
+    external_gateway_base_url().is_none()
         && backend_child_slot()
             .lock()
             .map(|g| g.is_some())
@@ -410,17 +410,56 @@ fn read_runtime_state_base_url() -> Option<String> {
     read_runtime_state().map(|s| s.base_url)
 }
 
-fn env_gateway_base_url() -> Option<String> {
-    // Only an explicit base URL means "operator-owned external Gateway".
-    // EVOFLOW_GATEWAY_PORT alone is a bind/prefer hint for the owned sidecar (pack/dev),
-    // not a signal to skip spawn — otherwise isolated bat (PORT=8070) never starts a child.
+/// Persisted cloud Gateway endpoint (P0). Lives in the active profile dir so an
+/// installed client and a dev client never overwrite each other's endpoint.
+fn gateway_endpoint_path() -> PathBuf {
+    runtime_dir().join("gateway-endpoint.json")
+}
+
+fn read_gateway_endpoint_file() -> Option<String> {
+    let raw = fs::read_to_string(gateway_endpoint_path()).ok()?;
+    let val: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let url = val
+        .get("base_url")
+        .and_then(|v| v.as_str())?
+        .trim()
+        .trim_end_matches('/')
+        .to_string();
+    if url.is_empty() {
+        None
+    } else {
+        Some(url)
+    }
+}
+
+/// Validate / normalize a user-supplied Gateway URL before persisting it.
+fn normalize_gateway_endpoint(raw: &str) -> Result<String, String> {
+    let url = raw.trim().trim_end_matches('/').to_string();
+    if url.is_empty() {
+        return Err("Gateway 地址不能为空".to_string());
+    }
+    let parsed = url::Url::parse(&url).map_err(|e| format!("Gateway 地址格式无效: {e}"))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err("Gateway 地址只支持 http:// 或 https://".to_string());
+    }
+    if parsed.host_str().unwrap_or_default().is_empty() {
+        return Err("Gateway 地址缺少主机名".to_string());
+    }
+    Ok(url)
+}
+
+/// Single source of truth for "do we own a local sidecar?".
+/// Priority: explicit process env (operator override) > persisted per-profile file.
+/// EVOFLOW_GATEWAY_PORT alone is a bind/prefer hint for the owned sidecar, NOT a
+/// signal to skip spawn — otherwise isolated bat (PORT=8070) never starts a child.
+fn external_gateway_base_url() -> Option<String> {
     if let Ok(env_url) = std::env::var("EVOFLOW_GATEWAY_URL") {
         let trimmed = env_url.trim().trim_end_matches('/').to_string();
         if !trimmed.is_empty() {
             return Some(trimmed);
         }
     }
-    None
+    read_gateway_endpoint_file()
 }
 
 fn preferred_sidecar_port_from_env() -> Option<u16> {
@@ -508,7 +547,7 @@ fn probe_gateway_candidate_ports() -> Option<u16> {
 /// Priority: explicit dev env > healthy runtime state > owned warming sidecar > live probe.
 /// Never returns a stale unhealthy runtime URL (avoids hammering dead :8012).
 pub fn resolved_gateway_base_url() -> String {
-    if let Some(base) = env_gateway_base_url() {
+    if let Some(base) = external_gateway_base_url() {
         return base;
     }
     if let Some(state) = read_runtime_state() {
@@ -1230,7 +1269,7 @@ fn ensure_backend_sidecar_inner(app: &tauri::AppHandle) -> Result<(), String> {
 
     // Dev / advanced setup: explicit Gateway env means this EvoPanel instance is bound
     // to that external backend. Do not spawn an embedded sidecar on another port.
-    if let Some(u) = env_gateway_base_url() {
+    if let Some(u) = external_gateway_base_url() {
         // Keep backend-runtime.json in sync so a later cold start without env
         // does not keep pointing at a stale packaged sidecar port (e.g. 8012).
         sync_runtime_state_from_base_url(&u);
@@ -1701,7 +1740,7 @@ fn stop_backend_sidecar_inner() -> Result<(), String> {
     // before the env-gateway short-circuit because lock files are cheap.
     release_profile_lock();
     // Dev/external Gateway is operator-owned (e.g. `uvicorn` on 8070). Never kill by port.
-    if let Some(u) = env_gateway_base_url() {
+    if let Some(u) = external_gateway_base_url() {
         append_startup_log(&format!(
             "stop_backend_sidecar: external Gateway configured ({u}); skip kill"
         ));
@@ -1842,7 +1881,7 @@ pub fn reload_langgraph_runtime(app: tauri::AppHandle) -> Result<(), String> {
     let _life = lifecycle_lock()
         .lock()
         .map_err(|_| "获取 Gateway 生命周期锁失败".to_string())?;
-    if env_gateway_base_url().is_some() {
+    if external_gateway_base_url().is_some() {
         append_startup_log("reload_langgraph_runtime: external Gateway — skip");
         return Ok(());
     }
@@ -2038,6 +2077,83 @@ pub fn get_gateway_base_url() -> String {
     resolved_gateway_base_url()
 }
 
+/// P0: inspect the persisted cloud Gateway endpoint and the effective URL.
+/// `source` is one of `env` / `file` / `local` so the settings UI can explain
+/// why a URL is in effect (env always wins over the persisted file).
+#[tauri::command]
+pub fn get_gateway_endpoint() -> serde_json::Value {
+    let env_url = std::env::var("EVOFLOW_GATEWAY_URL")
+        .ok()
+        .map(|s| s.trim().trim_end_matches('/').to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_default();
+    let file_url = read_gateway_endpoint_file().unwrap_or_default();
+    let external = external_gateway_base_url();
+    let (base_url, source) = if !env_url.is_empty() {
+        (env_url.clone(), "env")
+    } else if !file_url.is_empty() {
+        (file_url.clone(), "file")
+    } else {
+        (String::new(), "local")
+    };
+    json!({
+        "baseUrl": base_url,
+        "source": source,
+        "envUrl": env_url,
+        "fileUrl": file_url,
+        "external": external.is_some(),
+        "effectiveUrl": resolved_gateway_base_url(),
+        "configPath": gateway_endpoint_path().to_string_lossy().to_string(),
+    })
+}
+
+/// P0: persist a cloud Gateway endpoint. URL resolution picks it up immediately;
+/// restart EvoFlow to also skip spawning the local Gateway / LangGraph sidecars.
+/// `rename_all` keeps the JS invoke payload camelCase, matching gateway_health_probe
+/// and the camelCase keys returned by get_gateway_endpoint.
+#[tauri::command(rename_all = "camelCase")]
+pub fn set_gateway_endpoint(base_url: String) -> Result<serde_json::Value, String> {
+    let url = normalize_gateway_endpoint(&base_url)?;
+    fs::create_dir_all(runtime_dir()).map_err(|e| format!("创建 profile 目录失败: {e}"))?;
+    let payload = json!({
+        "base_url": url,
+        "updated_at": SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+    });
+    fs::write(
+        gateway_endpoint_path(),
+        serde_json::to_string_pretty(&payload).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| format!("保存 Gateway 配置失败: {e}"))?;
+    append_startup_log(&format!("cloud Gateway endpoint saved: {url}"));
+    Ok(get_gateway_endpoint())
+}
+
+/// P0: remove the persisted cloud endpoint and drop the derived runtime state,
+/// so a cold start regenerates a local-sidecar state instead of latching onto
+/// the old cloud URL.
+#[tauri::command]
+pub fn clear_gateway_endpoint() -> Result<serde_json::Value, String> {
+    let path = gateway_endpoint_path();
+    let previous = read_gateway_endpoint_file();
+    if path.exists() {
+        fs::remove_file(&path).map_err(|e| format!("删除 Gateway 配置失败: {e}"))?;
+    }
+    // backend-runtime.json may have been synced to the cloud URL by the
+    // external-Gateway early return on a previous launch. Only drop it when it
+    // actually points at the endpoint we just removed — deleting a healthy
+    // local-sidecar runtime state would make the running session lose its port.
+    if let (Some(prev), Some(state)) = (previous, read_runtime_state()) {
+        if state.base_url.trim_end_matches('/') == prev.as_str() {
+            let _ = fs::remove_file(runtime_state_path());
+        }
+    }
+    append_startup_log("cloud Gateway endpoint cleared");
+    Ok(get_gateway_endpoint())
+}
+
 /// Active profile id for the current process. Tauri calls this on the JS side
 /// to expose `window.__EVOFLOW_PROFILE_ID__` so the renderer can isolate its
 /// `client_instance_id`, sidecar routing, and any other per-profile state.
@@ -2056,7 +2172,7 @@ pub fn get_profile_info() -> serde_json::Value {
     let runtime_path = runtime_state_path();
     let home = super::runtime_data_dir();
     let base_url = resolved_gateway_base_url();
-    let external = env_gateway_base_url().is_some();
+    let external = external_gateway_base_url().is_some();
     let split = prefer_split_langgraph();
     let lg_port = if split {
         Some(resolve_langgraph_port(port))
@@ -2094,7 +2210,7 @@ pub fn reload_gateway(app: tauri::AppHandle) -> Result<(), String> {
     append_startup_log("reload_gateway requested");
     // External Gateway (EVOFLOW_GATEWAY_* / VITE_…): Panel must not stop_backend_sidecar /
     // kill_gateway_port — that murders the operator's terminal uvicorn, then skips respawn.
-    if let Some(u) = env_gateway_base_url() {
+    if let Some(u) = external_gateway_base_url() {
         append_startup_log(&format!(
             "reload_gateway: external Gateway ({u}) — skip stop/spawn (operator-owned)"
         ));

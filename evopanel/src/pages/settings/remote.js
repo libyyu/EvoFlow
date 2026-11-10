@@ -1,8 +1,11 @@
 /**
- * 设置 → WebUI 远程访问
- * 启用/停止开关 + 访问地址 + 账号密码管理 + 二维码登录。
+ * 设置 → WebUI 远程访问 + 云服 Gateway 端点（P0）
+ * 启用/停止开关 + 访问地址 + 账号密码管理 + 二维码登录；
+ * 桌面端额外提供外部 Gateway 地址配置与 /health/liveness 连通性自检。
  *
  * Backend: /api/webui/* (status, enable, disable, credentials, qr-token)
+ * Tauri: get_gateway_endpoint / set_gateway_endpoint / clear_gateway_endpoint /
+ *        gateway_health_probe
  */
 import { toast } from '../../components/toast.js'
 import {
@@ -27,6 +30,14 @@ let _initialPassword = null
 let _qrData = null
 /** @type {number | null} */
 let _qrRefreshTimer = null
+/** @type {any | null} P0: get_gateway_endpoint() 返回值；null = 尚未加载 / 非桌面端 */
+let _gatewayEndpoint = null
+/** @type {{ msg: string, kind: 'info'|'ok'|'bad' }} P0: 探测/保存结果行 */
+let _gatewayProbe = { msg: '', kind: 'info' }
+
+function isDesktop() {
+  return !!window.__TAURI_INTERNALS__
+}
 
 async function reloadGatewayIfDesktop() {
   if (!window.__TAURI_INTERNALS__) return
@@ -35,6 +46,17 @@ async function reloadGatewayIfDesktop() {
     await api.reloadGateway()
   } catch {
     /* gateway may still pick up bind-host on next manual restart */
+  }
+}
+
+/** P0: 桌面端读取持久化的云服 Gateway 配置；失败不阻塞整个设置页。 */
+async function loadGatewayEndpoint() {
+  if (!isDesktop()) return
+  try {
+    const { api } = await import('../../lib/tauri-api.js')
+    _gatewayEndpoint = await api.getGatewayEndpoint()
+  } catch (err) {
+    _gatewayEndpoint = { error: String(err?.message || err), source: 'local' }
   }
 }
 
@@ -202,6 +224,85 @@ function qrSectionHtml() {
   </div>`
 }
 
+// ── Cloud Gateway (P0) ───────────────────────────────────────
+
+const GATEWAY_SOURCE_LABEL = {
+  env: '进程环境变量 EVOFLOW_GATEWAY_URL（优先级最高）',
+  file: '本机持久化配置',
+  local: '本地 Gateway 进程（未配置云服）',
+}
+
+function gatewayStateHtml() {
+  const ep = _gatewayEndpoint || {}
+  if (ep.error) {
+    return `<p style="margin:6px 0;font-size:12px;color:var(--error,#ef4444)">读取配置失败：${escHtml(ep.error)}</p>`
+  }
+  const src = String(ep.source || 'local')
+  const sourceColor = src === 'local' ? 'var(--text-muted,#888)' : 'var(--success,#16a34a)'
+  const row = (label, value, color = '') => `
+    <tr>
+      <td style="padding:4px 0;width:96px;font-size:12px;color:var(--text-muted,#888);vertical-align:top">${escHtml(label)}</td>
+      <td style="padding:4px 0;font-size:12px;word-break:break-all"><code style="color:${color || 'inherit'}">${escHtml(value || '—')}</code></td>
+    </tr>`
+  return `
+    <table style="width:100%;border-collapse:collapse;margin:8px 0">
+      ${row('当前来源', GATEWAY_SOURCE_LABEL[src] || src, sourceColor)}
+      ${row('生效地址', ep.effectiveUrl)}
+      ${row('环境变量', ep.envUrl)}
+      ${row('配置文件值', ep.fileUrl)}
+      ${row('配置路径', ep.configPath)}
+    </table>`
+}
+
+function cloudGatewaySectionHtml() {
+  if (!isDesktop() || !_gatewayEndpoint) return ''
+  const ep = _gatewayEndpoint || {}
+  const defaultUrl = String(ep.fileUrl || ep.envUrl || '')
+  const probeColor = _gatewayProbe.kind === 'ok'
+    ? 'var(--success,#16a34a)'
+    : _gatewayProbe.kind === 'bad' ? 'var(--error,#ef4444)' : 'var(--text-muted,#888)'
+  return `
+  <div class="config-section" id="remote-cloud-gateway-section">
+    <div class="config-section-title">
+      <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 10h-1.26A8 8 0 109 20h9a5 5 0 000-10z"/><path d="M12 13v4M10 15h4"/></svg>
+      云服 Gateway
+    </div>
+    <p class="form-hint">把桌面端指向部署在云服的 Gateway。优先级：进程环境变量 &gt; 此处保存的配置 &gt; 本地 sidecar。P0 只改连接地址，本地 Gateway 进程仍会启动；P1 瘦包才会移除。</p>
+
+    <div id="remote-gateway-state">${gatewayStateHtml()}</div>
+
+    <label style="display:flex;flex-direction:column;gap:4px;margin:10px 0 8px">
+      <span style="font-size:12px;color:var(--text-muted,#888)">Gateway 地址（http:// 或 https://，不要带 /api）</span>
+      <input id="remote-gateway-url" class="cron-input" type="text"
+        placeholder="https://gateway.example.com" value="${escHtml(defaultUrl)}" style="width:100%" spellcheck="false" />
+    </label>
+
+    <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+      <button type="button" class="cron-btn sm" id="remote-gateway-test-btn">测试连接</button>
+      <button type="button" class="cron-btn sm primary" id="remote-gateway-save-btn">保存</button>
+      <button type="button" class="cron-btn sm" id="remote-gateway-clear-btn">清除并恢复本地</button>
+    </div>
+    <p id="remote-gateway-result" style="margin:8px 0 0;font-size:12px;min-height:16px;color:${probeColor}">${escHtml(_gatewayProbe.msg)}</p>
+    <p class="form-hint" style="margin:6px 0 0">保存后前端请求地址立即切换；<b>重启 EvoFlow</b> 才会跳过本地 Gateway / LangGraph 进程的启动。若「当前来源」是环境变量，保存配置文件不会立即生效，需先移除该环境变量。</p>
+  </div>`
+}
+
+/** 局部刷新状态区，避免整页重渲染导致输入框失焦 / 探测结果被清空。 */
+function refreshGatewayState(root) {
+  const slot = root?.querySelector('#remote-gateway-state')
+  if (slot) slot.innerHTML = gatewayStateHtml()
+}
+
+function setGatewayProbe(root, msg, kind = 'info') {
+  _gatewayProbe = { msg: String(msg || ''), kind }
+  const line = root?.querySelector('#remote-gateway-result')
+  if (!line) return
+  line.textContent = _gatewayProbe.msg
+  line.style.color = kind === 'ok'
+    ? 'var(--success,#16a34a)'
+    : kind === 'bad' ? 'var(--error,#ef4444)' : 'var(--text-muted,#888)'
+}
+
 function modalHtml(title, fields, btnId, btnLabel, extraHtml = '') {
   const inputs = fields.map((f) => `
     <label style="display:flex;flex-direction:column;gap:2px;margin-bottom:8px">
@@ -308,6 +409,7 @@ function showChangePasswordModal(onDone) {
 function fullHtml() {
   return `
   <div class="settings-modal-pane settings-modal-pane--remote settings-embed-wrap" id="remote-root">
+    ${cloudGatewaySectionHtml()}
     ${enableSectionHtml()}
     ${accessSectionHtml()}
     ${credentialSectionHtml()}
@@ -318,6 +420,78 @@ function fullHtml() {
 // ── Event wiring ─────────────────────────────────────────────
 
 function wireEvents(root) {
+  // ── P0: Cloud Gateway endpoint ─────────────────────────────
+  const gwUrl = () => String(root.querySelector('#remote-gateway-url')?.value || '')
+    .trim().replace(/\/+$/, '')
+
+  root.querySelector('#remote-gateway-test-btn')?.addEventListener('click', async () => {
+    const url = gwUrl()
+    if (!url) {
+      setGatewayProbe(root, '请先填写 Gateway 地址', 'bad')
+      return
+    }
+    setGatewayProbe(root, `正在探测 ${url}/health/liveness …`)
+    try {
+      const { api } = await import('../../lib/tauri-api.js')
+      const r = await api.probeGatewayEndpoint(url, 5000)
+      setGatewayProbe(root,
+        r.ok ? `连接成功（HTTP ${r.status || 200}）：${url}` : `连接失败（HTTP ${r.status || 0}）：${url}`,
+        r.ok ? 'ok' : 'bad')
+    } catch (err) {
+      setGatewayProbe(root, `探测失败：${err?.message || err}`, 'bad')
+    }
+  })
+
+  root.querySelector('#remote-gateway-save-btn')?.addEventListener('click', async () => {
+    const url = gwUrl()
+    if (!url) {
+      setGatewayProbe(root, '请先填写 Gateway 地址', 'bad')
+      return
+    }
+    try {
+      const mod = await import('../../lib/tauri-api.js')
+      const next = await mod.api.setGatewayEndpoint(url)
+      _gatewayEndpoint = next
+      // env 优先时不能把文件里的地址硬塞进前端 override，统一用后端给出的 effectiveUrl
+      if (next?.external && next.effectiveUrl) {
+        mod.setGatewayBaseUrlOverride(next.effectiveUrl)
+      } else {
+        mod.clearGatewayBaseUrlCache()
+      }
+      refreshGatewayState(root)
+      if (next?.source === 'env') {
+        setGatewayProbe(root, `已写入配置文件，但当前仍由环境变量 ${next.envUrl} 生效；移除该变量并重启后才会使用 ${url}`, 'info')
+      } else {
+        setGatewayProbe(root, `已保存：${next?.effectiveUrl || url}。当前会话请求已切换，重启 EvoFlow 可跳过本地 Gateway 进程。`, 'ok')
+      }
+      toast('云服 Gateway 已保存', 'success')
+    } catch (err) {
+      setGatewayProbe(root, `保存失败：${err?.message || err}`, 'bad')
+      toast(`保存失败：${err?.message || err}`, 'error')
+    }
+  })
+
+  root.querySelector('#remote-gateway-clear-btn')?.addEventListener('click', async () => {
+    if (!confirm('清除云服 Gateway 配置并恢复本地 Gateway？需要重启 EvoFlow 生效。')) return
+    try {
+      const mod = await import('../../lib/tauri-api.js')
+      const next = await mod.api.clearGatewayEndpoint()
+      _gatewayEndpoint = next
+      // 清掉 runtime override + cache，让下次 resolve 重新回到本地 sidecar
+      mod.setGatewayBaseUrlOverride('')
+      const input = root.querySelector('#remote-gateway-url')
+      if (input) input.value = ''
+      refreshGatewayState(root)
+      setGatewayProbe(root, next?.source === 'env'
+        ? '已清除配置文件，但环境变量仍在生效；请移除 EVOFLOW_GATEWAY_URL 后重启。'
+        : '已清除配置。请重启 EvoFlow 以重新启动本地 Gateway 进程。', 'ok')
+      toast('云服 Gateway 配置已清除', 'success')
+    } catch (err) {
+      setGatewayProbe(root, `清除失败：${err?.message || err}`, 'bad')
+      toast(`清除失败：${err?.message || err}`, 'error')
+    }
+  })
+
   // Toggle enable/disable
   root.querySelector('#remote-toggle')?.addEventListener('change', async (e) => {
     const checked = e.target.checked
@@ -460,6 +634,8 @@ export function cleanup() {
   _status = null
   _initialPassword = null
   _qrData = null
+  _gatewayEndpoint = null
+  _gatewayProbe = { msg: '', kind: 'info' }
   if (_qrRefreshTimer) {
     clearTimeout(_qrRefreshTimer)
     _qrRefreshTimer = null
@@ -474,7 +650,12 @@ export async function mountRemoteInto(container) {
   container.innerHTML = '<div class="stat-card loading-placeholder" style="height:120px"></div>'
 
   try {
-    _status = await getWebuiStatus()
+    // P0: 云服 Gateway 配置读取失败不阻塞 WebUI 设置页（loadGatewayEndpoint 内部吞错）
+    const [status] = await Promise.all([
+      getWebuiStatus(),
+      loadGatewayEndpoint(),
+    ])
+    _status = status
     container.innerHTML = fullHtml()
     wireEvents(container)
   } catch (err) {
