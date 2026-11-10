@@ -147,7 +147,9 @@ function updatePortalPosition(trigger, menu, placement) {
   menu.style.position = 'fixed'
   menu.style.left = `${Math.max(sidePad, Math.min(r.left, window.innerWidth - sidePad - minW))}px`
   menu.style.minWidth = `${minW}px`
-  menu.style.zIndex = '10060'
+  // 必须高于所有高层弹窗：.modal-overlay 是 1000020、agent-avatar 1000030，
+  // 旧值 10060 会让 portal 菜单被弹窗自身遮罩盖住（表单弹窗里的下拉点不到）。
+  menu.style.zIndex = '1000100'
 
   if (placement === 'up') {
     const bottom = Math.max(sidePad, window.innerHeight - r.top + gap)
