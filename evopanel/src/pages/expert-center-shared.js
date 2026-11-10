@@ -72,7 +72,9 @@ export function openDrawer(page, { title, subtitle = '', body = '', foot = '', m
   root.querySelector('[data-role="body"]').innerHTML = body || ''
   // 抽屉里的原生 <select> 也要走统一的自定义下拉增强（与 modal 一致），
   // 否则 WebView 原生弹层可能只渲染首项。全局 MutationObserver 兜底不可靠，这里显式增强。
-  enhanceSelectsIn(root)
+  // 注意：桌面端 WebView2 下 portal（menu 挂到 body + position:fixed）的弹层会异常不可见，
+  // 故抽屉内统一用非 portal 模式（menu 留在 wrapper 内 absolute），与已验证可用的方案一致。
+  enhanceSelectsIn(root, { portal: false })
   const footEl = root.querySelector('[data-role="foot"]')
   footEl.innerHTML = foot
     ? `<div class="ef-side-drawer__actions">${foot}</div>`
