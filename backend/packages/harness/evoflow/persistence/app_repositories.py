@@ -84,9 +84,14 @@ def save_revision(
         snap = _snapshot_from_document(document)
         conn.execute(
             """
-INSERT OR REPLACE INTO evoflow_app_revisions (
+INSERT INTO evoflow_app_revisions (
     app_id, version, snapshot_json, status, note, created_at
 ) VALUES (?, ?, ?, ?, ?, ?)
+ON CONFLICT(app_id, version) DO UPDATE SET
+    snapshot_json = excluded.snapshot_json,
+    status = excluded.status,
+    note = excluded.note,
+    created_at = excluded.created_at
 """,
             (
                 app_id,
@@ -225,7 +230,7 @@ def restore_app_from_revision(app_id: str, version: int, *, as_draft: bool = Tru
 
 
 def save_app(app_id: str, document: dict[str, Any]) -> None:
-    """Save or update an application definition (INSERT OR REPLACE) + revision snapshot."""
+    """Save or update an application definition (upsert) + revision snapshot."""
 
     def _do_save() -> None:
         conn = get_db()
@@ -250,13 +255,40 @@ def save_app(app_id: str, document: dict[str, Any]) -> None:
         version = int(document_n.get("version") or 1)
         conn.execute(
             """
-INSERT OR REPLACE INTO evoflow_apps (
+INSERT INTO evoflow_apps (
     id, name, description, icon, category,
     parameters_json, steps_json, goal_template, validation_template_json, flowchart_mermaid,
     execution_mode, auto_run, source, source_task_id, version,
     status, tags_json, created_at, updated_at, usage_count, last_used_at, canvas_json,
     answer_from_ref, final_rollup, final_rollup_agent, final_rollup_instruction, project_path
 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(id) DO UPDATE SET
+    name = excluded.name,
+    description = excluded.description,
+    icon = excluded.icon,
+    category = excluded.category,
+    parameters_json = excluded.parameters_json,
+    steps_json = excluded.steps_json,
+    goal_template = excluded.goal_template,
+    validation_template_json = excluded.validation_template_json,
+    flowchart_mermaid = excluded.flowchart_mermaid,
+    execution_mode = excluded.execution_mode,
+    auto_run = excluded.auto_run,
+    source = excluded.source,
+    source_task_id = excluded.source_task_id,
+    version = excluded.version,
+    status = excluded.status,
+    tags_json = excluded.tags_json,
+    created_at = excluded.created_at,
+    updated_at = excluded.updated_at,
+    usage_count = excluded.usage_count,
+    last_used_at = excluded.last_used_at,
+    canvas_json = excluded.canvas_json,
+    answer_from_ref = excluded.answer_from_ref,
+    final_rollup = excluded.final_rollup,
+    final_rollup_agent = excluded.final_rollup_agent,
+    final_rollup_instruction = excluded.final_rollup_instruction,
+    project_path = excluded.project_path
 """,
             (
                 app_id,
@@ -311,9 +343,14 @@ INSERT OR REPLACE INTO evoflow_apps (
             note = "publish" if snap.get("status") == "published" else "save"
             conn.execute(
                 """
-INSERT OR REPLACE INTO evoflow_app_revisions (
+INSERT INTO evoflow_app_revisions (
     app_id, version, snapshot_json, status, note, created_at
 ) VALUES (?, ?, ?, ?, ?, ?)
+ON CONFLICT(app_id, version) DO UPDATE SET
+    snapshot_json = excluded.snapshot_json,
+    status = excluded.status,
+    note = excluded.note,
+    created_at = excluded.created_at
 """,
                 (
                     app_id,
@@ -340,7 +377,7 @@ def set_app_owner_scope(
     owner_scope_id: str,
     created_by: str | None = None,
 ) -> None:
-    """Stamp ownership after save (INSERT OR REPLACE clears ACL cols)."""
+    """Stamp ownership after save (kept for old DBs; upsert now preserves ACL cols)."""
     aid = str(app_id or "").strip()
     if not aid:
         return
@@ -747,14 +784,31 @@ def save_run(run_id: str, document: dict[str, Any]) -> None:
                 "status": document.get("status", "running"),
             }
         )
-        # Use INSERT OR REPLACE for atomic upsert (avoids DELETE+INSERT race)
+        # Standard upsert (ON CONFLICT) — atomic, avoids DELETE+INSERT race
         conn.execute(
             """
-INSERT OR REPLACE INTO evoflow_app_runs (
+INSERT INTO evoflow_app_runs (
     id, app_id, app_version, parameters_json, execution_mode, task_id, thread_id,
     status, progress, result_summary, created_at, started_at, completed_at, error,
     queue_ms, duration_ms, timing_state
 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(id) DO UPDATE SET
+    app_id = excluded.app_id,
+    app_version = excluded.app_version,
+    parameters_json = excluded.parameters_json,
+    execution_mode = excluded.execution_mode,
+    task_id = excluded.task_id,
+    thread_id = excluded.thread_id,
+    status = excluded.status,
+    progress = excluded.progress,
+    result_summary = excluded.result_summary,
+    created_at = excluded.created_at,
+    started_at = excluded.started_at,
+    completed_at = excluded.completed_at,
+    error = excluded.error,
+    queue_ms = excluded.queue_ms,
+    duration_ms = excluded.duration_ms,
+    timing_state = excluded.timing_state
 """,
             (
                 run_id,
@@ -772,7 +826,7 @@ INSERT OR REPLACE INTO evoflow_app_runs (
                 document.get("completed_at"),
                 document.get("error"),
                 # Timings are derived here so every (re)write stays consistent with
-                # the timestamps — INSERT OR REPLACE would otherwise null them out.
+                # the timestamps (upsert rewrites them on every save).
                 _run_timing.get("queue_ms"),
                 _run_timing.get("duration_ms"),
                 _run_timing.get("timing_state"),

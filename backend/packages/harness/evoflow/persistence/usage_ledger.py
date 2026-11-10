@@ -964,7 +964,8 @@ def ensure_llm_ledger_rebuilt() -> None:
             return
         result = rebuild_llm_usage_ledger(db)
         db.execute(
-            "INSERT OR REPLACE INTO evoflow_usage_meta (key, value) VALUES (?, ?)",
+            "INSERT INTO evoflow_usage_meta (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             (_LLM_LEDGER_REBUILD_MARKER, utc_now_iso_z()),
         )
         logger.info("usage ledger rebuilt from chat messages: %s", result)

@@ -80,13 +80,23 @@ def migrate_push_bindings(db_path: str) -> None:
         # Only enable if: approval_channels includes 'feishu' AND has a binding
         should_enable_push = push_enabled and has_binding
         
-        # Insert or update binding
+        # Insert or update binding (upsert; other-channel cols are preserved
+        # on update, unlike the old INSERT OR REPLACE which nulled them).
         cur.execute("""
-            INSERT OR REPLACE INTO evoflow_role_push_bindings (
+            INSERT INTO evoflow_role_push_bindings (
                 agent_code, push_enabled, push_channels,
                 feishu_open_id, feishu_chat_id, feishu_user_id, feishu_target_type,
                 created_at, updated_at
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(agent_code) DO UPDATE SET
+                push_enabled = excluded.push_enabled,
+                push_channels = excluded.push_channels,
+                feishu_open_id = excluded.feishu_open_id,
+                feishu_chat_id = excluded.feishu_chat_id,
+                feishu_user_id = excluded.feishu_user_id,
+                feishu_target_type = excluded.feishu_target_type,
+                created_at = excluded.created_at,
+                updated_at = excluded.updated_at
         """, (
             agent_code,
             1 if should_enable_push else 0,

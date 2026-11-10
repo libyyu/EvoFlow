@@ -40,3 +40,52 @@ jobs:
       - name: Run unit tests of backend
         working-directory: backend
         run: make test
+
+  # PostgreSQL 后端集成：真库跑 db_backend/pg_ddl 全链路（方言单测 + live bootstrap）。
+  # 本机通常没有 PG 服务，这一步只在 CI 跑（services postgres 容器）。
+  pg-backend-tests:
+    if: github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: evoflow
+          POSTGRES_PASSWORD: evoflow_ci
+          POSTGRES_DB: evoflow_test
+        ports:
+          - 5432:5432
+        # 等待 PG 就绪再跑测试
+        options: >-
+          --health-cmd "pg_isready -U evoflow"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      EVOFLOW_DB_URL: postgresql://evoflow:evoflow_ci@localhost:5432/evoflow_test
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+
+      - name: Install backend dependencies + psycopg
+        working-directory: backend
+        run: |
+          uv sync --group dev
+          uv pip install "psycopg[binary]>=3.1,<4"
+
+      - name: Run PG backend tests (live + dialect)
+        working-directory: backend
+        run: uv run pytest tests/test_pg_backend.py -v
+

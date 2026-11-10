@@ -1,9 +1,16 @@
-"""Shared SQLite access for ``evoflow.db`` (WAL, schema init).
+"""Shared database access for ``evoflow.db`` (WAL, schema init).
 
-Uses one process-wide connection (``check_same_thread=False``) and an
-``RLock`` on every statement so FastAPI / ``asyncio.to_thread`` workers
-never open concurrent writers on separate connections (the usual cause of
-``database is locked`` here).
+Default backend: SQLite. Uses one process-wide connection
+(``check_same_thread=False``) and an ``RLock`` on every statement so FastAPI /
+``asyncio.to_thread`` workers never open concurrent writers on separate
+connections (the usual cause of ``database is locked`` here).
+
+Optional backend: PostgreSQL (cloud multi-worker deployments). Activated by
+``EVOFLOW_DB_URL=postgresql://...`` — see
+:mod:`evoflow.persistence.db_backend`. ``get_db()`` then returns a drop-in
+PostgresConnection wrapper; everything below (transactions, SAVEPOINT nesting,
+retries, schema version) works unchanged because the wrapper speaks the same
+DB-API surface and translates the SQLite dialect.
 
 Multi-statement batches (loop + single ``commit``) must run inside
 ``db_connection_lock()`` or ``run_db_with_retry`` / ``run_db_transaction``.
@@ -24,6 +31,7 @@ from typing import Any, TypeVar
 
 from evoflow.config.data_paths import DEFAULT_APP_DB_REL, resolve_app_db_config_path
 from evoflow.persistence.data_layout import ensure_data_layout
+from evoflow.persistence.db_backend import is_retryable_db_error, postgres_mode
 from evoflow.persistence.schema import ensure_app_schema
 
 logger = logging.getLogger(__name__)
@@ -34,6 +42,7 @@ _cached_default_path: Path | None = None
 _shared_conn: sqlite3.Connection | None = None
 _shared_conn_path: Path | None = None
 _shared_wrapper: Any = None
+_pg_wrapper: Any = None
 
 # Process-level flag: once a legacy column miss is observed on the shared
 # connection, run the backfill once and stop retrying. Subsequent misses are
@@ -395,20 +404,25 @@ def _open_shared_connection(path: Path) -> sqlite3.Connection:
 
 
 def run_db_with_retry[T](fn: Callable[[], T], *, max_attempts: int | None = None) -> T:
-    """Run a DB closure with process lock + sqlite busy retry."""
+    """Run a DB closure with process lock + transient-error retry.
+
+    Retries SQLite busy/locked errors and PostgreSQL serialization failures
+    / deadlocks / lock timeouts (see ``is_retryable_db_error``); everything
+    else propagates immediately.
+    """
     attempts = _DEFAULT_MAX_ATTEMPTS if max_attempts is None else max_attempts
     last: BaseException | None = None
     for attempt in range(max(1, int(attempts))):
         try:
             with db_connection_lock():
                 return fn()
-        except sqlite3.OperationalError as e:
+        except Exception as e:
             last = e
-            if not _is_sqlite_busy_error(e) or attempt >= attempts - 1:
+            if not is_retryable_db_error(e) or attempt >= attempts - 1:
                 raise
             delay = min(0.05 * (2**attempt), 2.5)
             logger.debug(
-                "sqlite busy/locked (attempt %s/%s), retry in %.2fs: %s",
+                "db busy/locked (attempt %s/%s), retry in %.2fs: %s",
                 attempt + 1,
                 attempts,
                 delay,
@@ -461,6 +475,9 @@ def _get_read_pool(path: Path) -> _queue.Queue[sqlite3.Connection]:
 def get_read_connection():
     """获取一个只读连接（从池中借出，用完归还）。
 
+    PostgreSQL 模式：直接复用共享连接（Phase 1 无独立读池；进程内读写仍由
+    RLock 串行，多进程并发由多个 gateway worker 各自的连接承担）。
+
     WAL 模式下读操作不会阻塞写连接上的事务，也不被写事务阻塞。
 
     池耗尽时不再无限等待：短暂等待后打开一条一次性只读连接兜底，
@@ -471,6 +488,9 @@ def get_read_connection():
         with get_read_connection() as db:
             rows = db.execute("SELECT ...").fetchall()
     """
+    if postgres_mode():
+        yield get_db()
+        return
     path = resolve_evolflow_db_path()
     pool = _get_read_pool(path)
     conn: sqlite3.Connection | None = None
@@ -521,8 +541,8 @@ def run_db_read[T](fn: Callable[[sqlite3.Connection], T]) -> T:
     try:
         try:
             return fn(db)
-        except sqlite3.OperationalError as e:
-            if _is_sqlite_busy_error(e):
+        except Exception as e:
+            if is_retryable_db_error(e):
                 time.sleep(0.05)
                 return fn(db)
             raise
@@ -555,8 +575,14 @@ def reset_read_pool_for_tests() -> None:
     shutdown_read_pool()
 
 
-def get_db(*, storage_sqlite_path: str | None = None) -> _LockedConnection:
-    """Shared locked connection; safe under FastAPI thread pool + background tasks."""
+def get_db(*, storage_sqlite_path: str | None = None) -> Any:
+    """Shared locked connection; safe under FastAPI thread pool + background tasks.
+
+    Returns the SQLite ``_LockedConnection`` by default, or the PostgreSQL
+    wrapper when ``EVOFLOW_DB_URL`` is set (same DB-API surface).
+    """
+    if postgres_mode():
+        return _get_postgres_db()
     global _shared_conn, _shared_conn_path, _shared_wrapper
     path = resolve_evolflow_db_path(storage_sqlite_path=storage_sqlite_path)
     with _lock:
@@ -573,10 +599,29 @@ def get_db(*, storage_sqlite_path: str | None = None) -> _LockedConnection:
         return _shared_wrapper
 
 
+def _get_postgres_db() -> Any:
+    """Open (once) the process-wide PostgreSQL connection wrapper."""
+    global _pg_wrapper
+    with _lock:
+        if _pg_wrapper is not None:
+            return _pg_wrapper
+        from evoflow.persistence.db_backend import open_postgres_connection
+
+        wrapper = open_postgres_connection()
+        _pg_wrapper = wrapper
+        return wrapper
+
+
 def reset_db_for_tests() -> None:
     """Close shared connection (tests only)."""
-    global _cached_default_path, _shared_conn, _shared_conn_path, _shared_wrapper
+    global _cached_default_path, _shared_conn, _shared_conn_path, _shared_wrapper, _pg_wrapper
     with _lock:
+        if _pg_wrapper is not None:
+            try:
+                _pg_wrapper.close()
+            except Exception:
+                pass
+        _pg_wrapper = None
         if _shared_conn is not None:
             try:
                 _shared_conn.close()
@@ -833,7 +878,8 @@ def run_deferred_full_preflight(*, base_dir: Path | None = None) -> dict[str, bo
     base = base_dir or resolve_data_base_dir()
     paths: list[tuple[str, Path]] = []
     try:
-        paths.append(("evoflow.db", resolve_evolflow_db_path()))
+        if not postgres_mode():
+            paths.append(("evoflow.db", resolve_evolflow_db_path()))
     except Exception:
         pass
     try:
@@ -874,7 +920,8 @@ def checkpoint_all_databases() -> dict[str, dict[str, int]]:
     base = resolve_data_base_dir()
     paths: dict[str, Path] = {}
     try:
-        paths["evoflow"] = resolve_evolflow_db_path()
+        if not postgres_mode():
+            paths["evoflow"] = resolve_evolflow_db_path()
     except Exception:
         pass
     try:

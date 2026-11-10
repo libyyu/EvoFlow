@@ -115,6 +115,29 @@ EVOFLOW_FRONTEND_BIND=0.0.0.0 docker compose -p evo-flow -f docker/docker-compos
 | nginx 路由规则 | 改 `docker/nginx/nginx.conf` 后重跑第 3 步命令 |
 | Gateway / LangGraph | 正常 `make up`（见下方注意事项） |
 
+## PostgreSQL 后端（多 worker 云部署，可选）
+
+默认（含桌面一体包）使用 SQLite。多用户云部署可切换 PostgreSQL 后端：
+
+1. 准备一个 PG 15+ 实例与空库（如 `evoflow`），账号需有建表权限。
+2. 安装可选依赖：`uv sync --extra postgres`（即 `psycopg[binary]>=3.1`）。
+3. 在 `.env` 里设置：
+
+   ```bash
+   EVOFLOW_DB_URL=postgresql://user:pass@host:5432/evoflow
+   ```
+
+重启 Gateway 即生效——启动时自动建全部 schema（124 张表 + 索引 + 外键），业务代码无需任何改动。
+
+**机制**：后端是一个与 SQLite 完全同构的连接包装器——`?` 占位符、`INSERT OR IGNORE`、`PRAGMA table_info` / `user_version`（映射为 `evoflow_schema_meta` 版本表）、`AUTOINCREMENT`、`strftime` 默认值等 SQLite 方言全部自动转换；`lastrowid` 用 `lastval()` 等价实现。SQLite 专属的 `INSERT OR REPLACE` 已在代码层重写为双方通用的 `ON CONFLICT ... DO UPDATE`。
+
+**当前限制（Phase 1）**：
+
+- 每个进程一条连接、语句串行（与 SQLite 相同的并发模型）；扩展靠多 worker，每 worker 各自持有连接。
+- `EVOFLOW_GATEWAY_WORKERS` 仍须保持 1（MCP OAuth 刷新锁是进程内的，见坑 2）；Redis 锁解除限制属后续计划。
+- 知识库向量（sqlite-vec）、代码索引、observability / checkpoints 三个辅助库仍为本地 SQLite 文件，不随主库迁移。
+- 连接参数与真实 PG 的端到端验证在 CI（`pg-backend-tests` job，postgres:16 service）覆盖，本地无需装 PG。
+
 ## 注意事项与坑
 
 1. **`make up` 会删掉 frontend 容器**。`scripts/deploy.sh` 带了 `--remove-orphans`，而 frontend 不在默认 profile 里，会被当作孤儿移除。每次 `make up` 之后需重跑第 3 步的 `--profile frontend` 命令。

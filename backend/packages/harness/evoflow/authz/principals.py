@@ -595,9 +595,11 @@ def update_principal(
                 )
             db.execute(
                 """
-                INSERT OR REPLACE INTO evoflow_principal_identities
+                INSERT INTO evoflow_principal_identities
                     (org_id, provider, external_id, principal_id)
                 VALUES (?, 'webui_username', ?, ?)
+                ON CONFLICT(org_id, provider, external_id) DO UPDATE SET
+                    principal_id = excluded.principal_id
                 """,
                 (org_id, new_username, pid),
             )

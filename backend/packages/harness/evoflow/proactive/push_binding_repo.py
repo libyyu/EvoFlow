@@ -141,7 +141,7 @@ class RolePushBindingRepository:
             push_channels_str = ",".join(ch for ch in policy.channels if policy.channels[ch].enabled)
             
             cur.execute("""
-                INSERT OR REPLACE INTO evoflow_role_push_bindings (
+                INSERT INTO evoflow_role_push_bindings (
                     agent_code, push_enabled, push_channels,
                     feishu_open_id, feishu_chat_id, feishu_user_id, feishu_target_type, feishu_verified_at,
                     wecom_bot_id, wecom_verified_at,
@@ -149,6 +149,21 @@ class RolePushBindingRepository:
                     email,
                     created_at, updated_at
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(agent_code) DO UPDATE SET
+                    push_enabled = excluded.push_enabled,
+                    push_channels = excluded.push_channels,
+                    feishu_open_id = excluded.feishu_open_id,
+                    feishu_chat_id = excluded.feishu_chat_id,
+                    feishu_user_id = excluded.feishu_user_id,
+                    feishu_target_type = excluded.feishu_target_type,
+                    feishu_verified_at = excluded.feishu_verified_at,
+                    wecom_bot_id = excluded.wecom_bot_id,
+                    wecom_verified_at = excluded.wecom_verified_at,
+                    slack_channel_id = excluded.slack_channel_id,
+                    slack_verified_at = excluded.slack_verified_at,
+                    email = excluded.email,
+                    created_at = excluded.created_at,
+                    updated_at = excluded.updated_at
             """, (
                 policy.agent_code,
                 1 if policy.push_enabled else 0,

@@ -53,6 +53,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# 云端多 worker 部署的 PostgreSQL 后端（EVOFLOW_DB_URL=postgresql://...）。
+# 本地单用户/桌面模式不需要——默认 SQLite。
+postgres = ["psycopg[binary]>=3.1,<4"]
 # 保留 extra 名以兼容旧文档/脚本；sentence-transformers 已并入默认 dependencies
 # （macOS Intel x86_64 除外，见上方 marker）。
 local-embedding = []
