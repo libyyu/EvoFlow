@@ -1,11 +1,11 @@
-# EvoFlow 云端后端部署速览（cceffd4f）
+# EvoFlow 云端后端部署速览
 
 纯后端包（无 Web 前端产物）。完整文档见包内 `docs/contribute/deploy-cloud.md`。
 
 ## 一键部署
 
 ```bash
-tar xzf evoflow-cloud-backend-cceffd4f.tar.gz
+tar xzf <包文件名>
 cd evoflow-cloud-backend-cceffd4f
 
 # 标准模式（SQLite + 单 worker）
